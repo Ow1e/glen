@@ -23,5 +23,5 @@ jobs:
           nimble --accept yes refresh
       - name: Run tests
         run: |
-          nimble test -y
+          nimble --accept yes test
 
