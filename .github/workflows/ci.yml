@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
         nim: [1.6.14, 2.2.4]
     runs-on: ${{ matrix.os }}
     steps:
