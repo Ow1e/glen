@@ -72,6 +72,7 @@ proc openSegment(wal: WriteAheadLog) =
   if wal.fs != nil:
     wal.fs.flushFile()
     wal.fs.close()
+    wal.fs = nil
   wal.fs = open(segmentPath(wal.dir, wal.currentIndex), fmAppend)
   if wal.fs.getFileSize == 0:
     # new file: write magic + version header
@@ -103,6 +104,7 @@ proc reset*(wal: WriteAheadLog) =
   if wal.fs != nil:
     wal.fs.flushFile()
     wal.fs.close()
+    wal.fs = nil
   var idx = 0
   while true:
     let path = segmentPath(wal.dir, idx)
@@ -207,4 +209,6 @@ iterator replay*(dir: string): WalRecord =
     inc idx
 
 proc close*(wal: WriteAheadLog) =
-  if wal.fs != nil: wal.fs.close()
+  if wal.fs != nil:
+    wal.fs.close()
+    wal.fs = nil
