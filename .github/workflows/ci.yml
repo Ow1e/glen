@@ -20,8 +20,8 @@ jobs:
           nim-version: ${{ matrix.nim }}
       - name: Install deps
         run: |
-          nimble --accept yes refresh
+          nimble -y refresh
       - name: Run tests
         run: |
-          nimble --accept yes test
+          nimble test -y
 
