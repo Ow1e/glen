@@ -94,6 +94,61 @@ proc get*(db: GlenDB; collection, docId: string; t: Txn): Value =
     t.recordRead(Id(collection: collection, docId: docId, version: ver))
   return v
 
+## Batch get by ids. Returns pairs of (docId, Value) for those found.
+## Uses the cache when available and acquires the DB read lock once per call.
+proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(string, Value)] =
+  result = @[]
+  # First consult cache for fast hits
+  var missing: seq[string] = @[]
+  for id in docIds:
+    let key = collection & ":" & id
+    let cached = db.cache.get(key)
+    if cached != nil:
+      result.add((id, cached.clone()))
+    else:
+      missing.add(id)
+  if missing.len == 0: return
+  # Fill misses under a single read lock
+  acquireRead(db.rw)
+  if collection in db.collections:
+    let coll = db.collections[collection]
+    for id in missing:
+      if id in coll:
+        let v = coll[id]
+        db.cache.put(collection & ":" & id, v)
+        result.add((id, v.clone()))
+  releaseRead(db.rw)
+
+## Transaction-aware batch get. Records read versions for OCC.
+proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]; t: Txn): seq[(string, Value)] =
+  let pairs = db.getMany(collection, docIds)
+  for (id, _) in pairs:
+    var ver: uint64 = 0
+    if collection in db.versions and id in db.versions[collection]:
+      ver = db.versions[collection][id]
+    t.recordRead(Id(collection: collection, docId: id, version: ver))
+  return pairs
+
+## Get all documents in a collection. Returns pairs of (docId, Value).
+proc getAll*(db: GlenDB; collection: string): seq[(string, Value)] =
+  result = @[]
+  acquireRead(db.rw)
+  if collection in db.collections:
+    for id, v in db.collections[collection]:
+      db.cache.put(collection & ":" & id, v)
+      result.add((id, v.clone()))
+  releaseRead(db.rw)
+
+## Transaction-aware getAll. Records read versions for all returned docs.
+proc getAll*(db: GlenDB; collection: string; t: Txn): seq[(string, Value)] =
+  let pairs = db.getAll(collection)
+  for (id, _) in pairs:
+    var ver: uint64 = 0
+    if collection in db.versions and id in db.versions[collection]:
+      ver = db.versions[collection][id]
+    t.recordRead(Id(collection: collection, docId: id, version: ver))
+  return pairs
+
 ## Upsert a document value. Appends to WAL, updates in-memory state, versions,
 ## cache, and notifies subscribers.
 proc put*(db: GlenDB; collection, docId: string; value: Value) =

@@ -92,3 +92,17 @@ suite "basic db ops":
     var descIds: seq[string] = @[]
     for row in descRows: descIds.add(row[0])
     check descIds == @["3", "1"]
+
+  test "batch getMany and getAll":
+    let dir = getTempDir() / "glen_test_batch"
+    let db = newGlenDB(dir)
+    var u1 = VObject(); u1["name"] = VString("A"); db.put("users", "1", u1)
+    var u2 = VObject(); u2["name"] = VString("B"); db.put("users", "2", u2)
+    var u3 = VObject(); u3["name"] = VString("C"); db.put("users", "3", u3)
+    let many = db.getMany("users", ["1", "3", "x"])  # includes a missing id
+    var ids: seq[string] = @[]
+    for (id, _) in many: ids.add(id)
+    check ids.len == 2
+    check ("1" in ids) and ("3" in ids)
+    let allRows = db.getAll("users")
+    check allRows.len == 3

@@ -24,6 +24,25 @@ proc benchGet(db: glendb.GlenDB; N: int) =
   let rate = if dtMs == 0: 0.0 else: (float(N) * 1000.0) / float(dtMs)
   echo &"BENCH gets: {N} ops in {dtMs} ms => {rate:.1f} ops/s (hits {sum})"
 
+proc benchGetMany(db: glendb.GlenDB; N: int; batchSize: int) =
+  ## Prepare ids
+  var ids: seq[string] = @[]
+  for i in 0 ..< N:
+    ids.add("k" & $i)
+  let t0 = epochTime()
+  var pos = 0
+  var hits = 0
+  while pos < ids.len:
+    let until = min(pos + batchSize, ids.len)
+    let sliceIds = ids[pos ..< until]
+    for (_, v) in db.getMany("bench", sliceIds):
+      if not v.isNil: inc hits
+    pos = until
+  let dtMs = int64((epochTime() - t0) * 1000.0)
+  let ops = (ids.len div batchSize) + (if ids.len mod batchSize == 0: 0 else: 1)
+  let rate = if dtMs == 0: 0.0 else: (float(ops) * 1000.0) / float(dtMs)
+  echo &"BENCH getMany: {N} docs in {dtMs} ms => {rate:.1f} batches/s (hits {hits})"
+
 proc benchTxn(db: glendb.GlenDB; N: int) =
   let t0 = epochTime()
   for i in 0 ..< N:
@@ -43,6 +62,7 @@ when isMainModule:
   let N = 5000
   benchPut(database, N)
   benchGet(database, N)
+  benchGetMany(database, N, 100)
   benchTxn(database, 1000)
   database.close()
 
