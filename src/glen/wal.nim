@@ -163,10 +163,13 @@ proc append*(wal: WriteAheadLog; rec: WalRecord) =
   # include 4 bytes for checksum
   wal.rotateIfNeeded(headerStr.len + 4 + body.len)
   wal.fs.write(headerStr)
-  # write checksum (little-endian)
-  var cs = newStringStream()
-  cs.write(crc)
-  wal.fs.write(cs.data)
+  # write checksum (little-endian) without extra allocation
+  var csBuf: array[4, byte]
+  csBuf[0] = byte(crc and 0xFF)
+  csBuf[1] = byte((crc shr 8) and 0xFF)
+  csBuf[2] = byte((crc shr 16) and 0xFF)
+  csBuf[3] = byte((crc shr 24) and 0xFF)
+  discard wal.fs.writeBuffer(addr csBuf[0], 4)
   wal.fs.write(body)
   wal.currentSize += headerStr.len + 4 + body.len
   let written = headerStr.len + 4 + body.len

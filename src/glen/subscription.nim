@@ -18,6 +18,8 @@ type
     subs: Table[string, SubEntry]
     fieldSubs: Table[string, FieldSubEntry]
     fieldDeltaSubs: Table[string, FieldDeltaSubEntry]
+    ## Cache of split field paths per (key -> path -> parts)
+    pathPartsCache: Table[string, Table[string, seq[string]]]
 
   SubscriptionHandle* = object
     key*: string
@@ -49,7 +51,8 @@ proc newSubscriptionManager*(): SubscriptionManager =
   result = SubscriptionManager(
     subs: initTable[string, SubEntry](),
     fieldSubs: initTable[string, FieldSubEntry](),
-    fieldDeltaSubs: initTable[string, FieldDeltaSubEntry]()
+    fieldDeltaSubs: initTable[string, FieldDeltaSubEntry](),
+    pathPartsCache: initTable[string, Table[string, seq[string]]]()
   )
   initLock(result.lock)
 
@@ -134,17 +137,26 @@ proc unsubscribeField*(sm: SubscriptionManager; h: FieldSubscriptionHandle) =
       sm.fieldSubs[h.key].callbacksByPath.del(h.path)
       if sm.fieldSubs[h.key].callbacksByPath.len == 0:
         sm.fieldSubs.del(h.key)
+        if h.key in sm.pathPartsCache: sm.pathPartsCache.del(h.key)
     else:
       sm.fieldSubs[h.key].callbacksByPath[h.path] = newCbs
   release(sm.lock)
 
-proc getFieldByPath(v: Value; fieldPath: string): Value =
+proc getFieldByParts(v: Value; parts: seq[string]): Value =
   if v.isNil: return nil
   var cur = v
-  for p in fieldPath.split('.'):
+  for p in parts:
     if cur.isNil or cur.kind != vkObject: return nil
     cur = cur[p]
   return cur
+
+proc getCachedParts(sm: SubscriptionManager; key, path: string): seq[string] =
+  ## Returns cached split parts for a path; caches if missing.
+  if key notin sm.pathPartsCache:
+    sm.pathPartsCache[key] = initTable[string, seq[string]]()
+  if path notin sm.pathPartsCache[key]:
+    sm.pathPartsCache[key][path] = path.split('.')
+  sm.pathPartsCache[key][path]
 
 proc notifyFieldChanges*(sm: SubscriptionManager; id: Id; oldDoc, newDoc: Value) =
   let key = makeKey(id.collection, id.docId)
@@ -153,8 +165,9 @@ proc notifyFieldChanges*(sm: SubscriptionManager; id: Id; oldDoc, newDoc: Value)
   acquire(sm.lock)
   if key in sm.fieldSubs:
     for path, cbs in sm.fieldSubs[key].callbacksByPath.pairs:
-      let oldV = getFieldByPath(oldDoc, path)
-      let newV = getFieldByPath(newDoc, path)
+      let parts = sm.getCachedParts(key, path)
+      let oldV = getFieldByParts(oldDoc, parts)
+      let newV = getFieldByParts(newDoc, parts)
       if oldV == newV:
         continue
       for cb in cbs:
@@ -162,8 +175,9 @@ proc notifyFieldChanges*(sm: SubscriptionManager; id: Id; oldDoc, newDoc: Value)
           toCall.add((cb, path, oldV, newV))
   if key in sm.fieldDeltaSubs:
     for path, cbs in sm.fieldDeltaSubs[key].callbacksByPath.pairs:
-      let oldV = getFieldByPath(oldDoc, path)
-      let newV = getFieldByPath(newDoc, path)
+      let parts = sm.getCachedParts(key, path)
+      let oldV = getFieldByParts(oldDoc, parts)
+      let newV = getFieldByParts(newDoc, parts)
       if oldV == newV:
         continue
       # Build delta event Value with a simple schema:
@@ -228,6 +242,7 @@ proc unsubscribeFieldDelta*(sm: SubscriptionManager; h: FieldDeltaSubscriptionHa
       sm.fieldDeltaSubs[h.key].callbacksByPath.del(h.path)
       if sm.fieldDeltaSubs[h.key].callbacksByPath.len == 0:
         sm.fieldDeltaSubs.del(h.key)
+        if h.key in sm.pathPartsCache: sm.pathPartsCache.del(h.key)
     else:
       sm.fieldDeltaSubs[h.key].callbacksByPath[h.path] = newCbs
   release(sm.lock)
