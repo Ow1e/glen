@@ -20,7 +20,10 @@ const testFiles = @[
   "tests/test_wal_snapshot.nim",
   "tests/test_subscriptions.nim",
   "tests/test_cache.nim",
-  "tests/test_codec.nim"
+  "tests/test_codec.nim",
+  "tests/test_soak.nim",
+  "tests/test_soak_index.nim",
+  "tests/test_bench.nim"
 ]
 
 task test, "Run test suite":

@@ -50,7 +50,7 @@
   - [x] Cache behavior (eviction).
   - [x] Fuzz tests for `codec` and snapshot round-trip.
   - [ ] Windows-specific durability paths.
-  - [ ] Soak tests (long-running concurrency + durability)
+  - [x] Soak tests (long-running concurrency + durability)
   - [ ] Property tests for transactions (isolation, version monotonicity)
   - [ ] Indexing and query tests for range edges and composite ordering
 
