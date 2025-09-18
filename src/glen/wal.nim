@@ -12,9 +12,12 @@ import glen/types, glen/codec
 const WAL_PREFIX = "glen.wal."
 const WAL_MAGIC = "GLENWAL1"
 const WAL_VERSION = 1'u32
+const MAX_WAL_RECORD_SIZE = 64 * 1024 * 1024  # 64 MiB safety cap
 
 type
   WalRecordType* = enum wrPut = 1, wrDelete = 2
+
+  WalSyncMode* = enum wsmAlways, wsmInterval, wsmNone
 
   WalRecord* = object
     kind*: WalRecordType
@@ -29,6 +32,9 @@ type
     currentIndex: int
     currentSize: int
     fs: File
+    syncMode: WalSyncMode
+    flushEveryBytes: int
+    bytesSinceFlush: int
 
 proc fnv1a32(data: string): uint32 =
   var h: uint32 = 0x811C9DC5'u32
@@ -48,12 +54,14 @@ proc writeVarUint(s: Stream; x: uint64) =
 
 proc readVarUint(s: Stream): uint64 =
   var shift: uint32
-    
+  var iterations = 0
   while true:
     let b = s.readUint8()
     result = result or (uint64(b and 0x7F) shl shift)
     if (b and 0x80) == 0: break
     shift += 7
+    inc iterations
+    if iterations > 10: raise newException(IOError, "varuint too long")
 
 proc segmentPath(dir: string; idx: int): string =
   dir / (WAL_PREFIX & $idx)
@@ -84,9 +92,9 @@ proc openSegment(wal: WriteAheadLog) =
     flushDir(wal.dir)
   wal.currentSize = int(wal.fs.getFileSize())
 
-proc openWriteAheadLog*(dir: string; maxSegmentSize = 8 * 1024 * 1024): WriteAheadLog =
+proc openWriteAheadLog*(dir: string; maxSegmentSize = 8 * 1024 * 1024; syncMode: WalSyncMode = wsmAlways; flushEveryBytes = 1 * 1024 * 1024): WriteAheadLog =
   createDir(dir)
-  result = WriteAheadLog(dir: dir, maxSegmentSize: maxSegmentSize)
+  result = WriteAheadLog(dir: dir, maxSegmentSize: maxSegmentSize, syncMode: syncMode, flushEveryBytes: flushEveryBytes, bytesSinceFlush: 0)
   # find last segment
   var idx = 0
   while fileExists(segmentPath(dir, idx + 1)): inc idx
@@ -161,7 +169,18 @@ proc append*(wal: WriteAheadLog; rec: WalRecord) =
   wal.fs.write(cs.data)
   wal.fs.write(body)
   wal.currentSize += headerStr.len + 4 + body.len
-  wal.fs.flushFile()
+  let written = headerStr.len + 4 + body.len
+  case wal.syncMode
+  of wsmAlways:
+    wal.fs.flushFile()
+    wal.bytesSinceFlush = 0
+  of wsmInterval:
+    wal.bytesSinceFlush += written
+    if wal.bytesSinceFlush >= wal.flushEveryBytes:
+      wal.fs.flushFile()
+      wal.bytesSinceFlush = 0
+  of wsmNone:
+    discard
 
 iterator replay*(dir: string): WalRecord =
   var idx = 0
@@ -185,6 +204,10 @@ iterator replay*(dir: string): WalRecord =
     while not fs.atEnd:
       try:
         let recLen = readVarUint(fs)
+        # Guard record size to avoid pathological allocations
+        if recLen > uint64(MAX_WAL_RECORD_SIZE):
+          ok = false
+          break
         let crcOnDisk = fs.readUint32()
         let body = if recLen > 0: fs.readStr(int(recLen)) else: ""
         if fnv1a32(body) != crcOnDisk:
@@ -212,3 +235,8 @@ proc close*(wal: WriteAheadLog) =
   if wal.fs != nil:
     wal.fs.close()
     wal.fs = nil
+
+proc setSyncPolicy*(wal: WriteAheadLog; mode: WalSyncMode; flushEveryBytes = 0) =
+  wal.syncMode = mode
+  if mode == wsmInterval and flushEveryBytes > 0:
+    wal.flushEveryBytes = flushEveryBytes

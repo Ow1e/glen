@@ -1,7 +1,7 @@
 import std/os
 import std/unittest
 import std/tables
-import glen/wal, glen/storage, glen/codec
+import glen/wal, glen/storage
 import glen/types
 import glen/db
 

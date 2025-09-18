@@ -16,6 +16,10 @@ type
     capacity*: int
     current: int
     lock: Lock
+    hits*: int
+    misses*: int
+    puts*: int
+    evictions*: int
 
 proc newLruCache*(capacity: int): LruCache =
   result = LruCache(map: initTable[string, CacheEntry](), capacity: capacity)
@@ -61,7 +65,9 @@ proc get*(c: LruCache; key: string): Value =
   if key in c.map:
     let e = c.map[key]
     c.touch(e)
+    inc c.hits
     return e.value
+  inc c.misses
 
 proc put*(c: LruCache; key: string; value: Value) =
   acquire(c.lock)
@@ -78,11 +84,13 @@ proc put*(c: LruCache; key: string; value: Value) =
     c.map[key] = e
     c.addFront(e)
     c.current += size
+    inc c.puts
   while c.current > c.capacity and c.tail != nil:
     let victim = c.tail
     c.removeNode(victim)
     c.map.del(victim.key)
     c.current -= victim.size
+    inc c.evictions
 
 proc adjustCapacity*(c: LruCache; newCap: int) =
   acquire(c.lock)

@@ -162,10 +162,124 @@ echo o["n"].toIntOpt().get()        # 7
 - Snapshot files are written atomically (temp-file + rename) with best-effort directory flush on Windows
 - Recovery: load snapshots first, then replay WAL segments until the tail
 
+### WAL sync policy (durability vs throughput)
+
+By default Glen flushes (`fsync`) on every append for maximum durability. You can tune this:
+
+- `wsmAlways` (default): flush every WAL append.
+- `wsmInterval`: batch fsyncs based on a byte threshold.
+- `wsmNone`: rely on OS page cache (fastest, least durable).
+
+Usage:
+
+```nim
+import glen/db, glen/wal
+
+let db = newGlenDB("./mydb", walSync = wsmInterval)      # interval policy
+db.wal.setSyncPolicy(wsmInterval, flushEveryBytes = 1_048_576)  # 1 MiB batches
+```
+
+Note: On Windows, directory metadata is flushed when new WAL segments or snapshots are created. On POSIX, standard file flush is used.
+
 ## Binary formats
 
 - Codec: tagged binary format (null/bool/int/float/string/bytes/array/object/id) with varuints and zigzag ints
 - Snapshot: varuint count, then (idLen|id|valueLen|valueBinary) repeated
+
+### Streaming codec and runtime limits
+
+Glen’s codec is available in two forms:
+
+- Buffer API: `encode(value): string` and `decode(string): Value`
+- Streaming API: `encodeTo(stream, value)` and `decodeFrom(stream)` (exported via `glen/codec_stream`).
+
+Runtime limits are configurable via environment variables (defaults in parentheses):
+
+- `GLEN_MAX_STRING_OR_BYTES` (16 MiB)
+- `GLEN_MAX_ARRAY_LEN` (1,000,000)
+- `GLEN_MAX_OBJECT_FIELDS` (1,000,000)
+
+Example:
+
+```bash
+set GLEN_MAX_STRING_OR_BYTES=33554432
+set GLEN_MAX_ARRAY_LEN=2000000
+set GLEN_MAX_OBJECT_FIELDS=2000000
+```
+
+Streaming usage:
+
+```nim
+import std/streams
+import glen/types, glen/codec_stream
+
+var ss = newStringStream()
+encodeTo(ss, VArray(@[VInt(1), VString("x")]))
+ss.setPosition(0)
+let v = decodeFrom(ss)
+```
+
+### Streaming subscriptions
+
+You can stream document updates to any `Stream`. Each event is a Glen `Value` object encoded with the streaming codec and has fields: `collection`, `docId`, `version`, `value`.
+
+```nim
+import std/streams
+import glen/glen
+
+let db = newGlenDB("./mydb")
+var ss = newStringStream()
+let h = db.subscribe("users", "u1", proc (id: Id; v: Value) = discard)  # regular callback
+let hs = db.subs.subscribeStream("users", "u1", ss)                      # streaming
+
+db.put("users", "u1", VString("hi"))
+
+ss.setPosition(0)
+let ev = decodeFrom(ss)                   # => {collection:"users", docId:"u1", version:1, value:"hi"}
+
+db.unsubscribe(hs)
+```
+
+### Field-level subscriptions
+
+Subscribe to a single field path on a document. Callbacks fire only if that field’s value actually changes (deep equality):
+
+```nim
+import glen/glen
+
+let db = newGlenDB("./mydb")
+let h = db.subscribeField("users", "u1", "profile.age", proc(id: Id; path: string; oldV: Value; newV: Value) =
+  echo path, ": ", $oldV, " -> ", $newV
+)
+
+db.put("users", "u1", VObject())                # no event
+var u = VObject(); var p = VObject(); p["age"] = VInt(30); u["profile"] = p
+db.put("users", "u1", u)                         # profile.age: nil -> 30 (fires)
+
+db.unsubscribeField(h)
+```
+
+You can also stream field-level events to a `Stream` with `subscribeFieldStream`.
+
+#### Delta field subscriptions
+
+For large strings or frequently-growing values, subscribe to just the delta:
+
+```nim
+let h = db.subscribeFieldDelta("logs", "x1", "text", proc(id: Id; path: string; delta: Value) =
+  # delta is an object with { kind: "append"|"replace"|"delete"|"set", ... }
+  echo delta
+)
+
+var v = VObject(); v["text"] = VString("hello")
+db.put("logs", "x1", v)                      # {kind:"set", new:"hello"}
+v["text"] = VString("hello world")
+db.put("logs", "x1", v)                      # {kind:"append", added:" world"}
+
+db.unsubscribeFieldDelta(h)
+```
+
+Delta stream: `subscribeFieldDeltaStream` writes framed events with `{collection, docId, version, fieldPath, delta}`.
 
 ## Testing
 

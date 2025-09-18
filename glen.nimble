@@ -21,6 +21,9 @@ const testFiles = @[
   "tests/test_subscriptions.nim",
   "tests/test_cache.nim",
   "tests/test_codec.nim",
+  "tests/test_codec_stream.nim",
+  "tests/test_subscriptions_stream.nim",
+  "tests/test_subscriptions_field.nim",
   "tests/test_soak.nim",
   "tests/test_soak_index.nim",
   "tests/test_bench.nim"

@@ -1,6 +1,5 @@
 # Glen root module re-exporting public API
 
-import std/[tables, locks]
 import glen/types
 import glen/codec
 import glen/wal
@@ -11,10 +10,11 @@ import glen/txn
 import glen/db
 import glen/util
 import glen/index
+import glen/codec_stream
 
 # Public exports
 
-export types, codec, wal, storage, cache, subscription, txn, db, util, index
+export types, codec, codec_stream, wal, storage, cache, subscription, txn, db, util, index
 
 # Placeholder openDatabase
 proc openDatabase*(path: string): GlenDB =

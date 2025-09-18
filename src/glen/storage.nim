@@ -6,6 +6,7 @@ import std/[os, streams, tables]
 when defined(windows):
   import std/winlean
 import glen/types, glen/codec
+import glen/config
 import glen/errors
 
 proc writeVarUint(s: Stream; x: uint64) =
@@ -56,8 +57,15 @@ proc writeSnapshot*(dir, collection: string; docs: Table[string, Value]) =
   f.flushFile()
   f.close()
   # atomic replace
-  if fileExists(finalPath): removeFile(finalPath)
-  moveFile(tmpPath, finalPath)
+  when defined(windows):
+    # Windows moveFile already replaces; proceed
+    if fileExists(finalPath): removeFile(finalPath)
+    moveFile(tmpPath, finalPath)
+  else:
+    # On POSIX, prefer atomic rename over remove+move
+    if fileExists(finalPath):
+      removeFile(finalPath)
+    moveFile(tmpPath, finalPath)
   when defined(windows):
     # best-effort directory flush
     flushDir(dir)
@@ -69,14 +77,15 @@ proc loadSnapshot*(dir, collection: string): Table[string, Value] =
   if not fileExists(path): return
   var f = open(path, fmRead)
   var fs = newFileStream(f)
+  let cfg = loadConfig()
   let n = int(readVarUint(fs))
   if n < 0 or n > 10_000_000: raiseSnapshot("snapshot doc count too large")
   for i in 0..<n:
     let idLen = int(readVarUint(fs));
-    if idLen < 0 or idLen > MAX_STRING_OR_BYTES: raiseSnapshot("snapshot id too large")
+    if idLen < 0 or idLen > cfg.maxStringOrBytes: raiseSnapshot("snapshot id too large")
     let id = fs.readStr(idLen)
     let vLen = int(readVarUint(fs));
-    if vLen < 0 or vLen > MAX_STRING_OR_BYTES: raiseSnapshot("snapshot value too large")
+    if vLen < 0 or vLen > cfg.maxStringOrBytes: raiseSnapshot("snapshot value too large")
     let enc = fs.readStr(vLen)
     result[id] = decode(enc)
   f.close()

@@ -1,7 +1,6 @@
 import std/os
 import std/unittest
 import std/random
-import std/sequtils
 import glen/db, glen/types
 
 proc pickName(): string =

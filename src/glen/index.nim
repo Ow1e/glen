@@ -1,4 +1,4 @@
-import std/[tables, sets, strutils]
+import std/[tables, sets, strutils, critbits]
 import glen/types
 
 type
@@ -11,8 +11,8 @@ type
     spec*: IndexSpec
     ## key (serialized Value for equality/range) -> set of docIds
     map: Table[string, HashSet[string]]
-    ## sorted list of keys for range and orderBy
-    keys: seq[string]
+    ## ordered set of keys for range and orderBy (lexicographic)
+    keysTree: CritBitTree[bool]
 
   IndexesByName* = Table[string, Index]
 
@@ -26,16 +26,34 @@ proc serializePart(v: Value): string =
     let u = uint64(v.i) + (1'u64 shl 63)
     return "I|" & toHex(u, 16)
   of vkFloat:
-    ## approximate ordering by formatting
-    return "F|" & $v.f
+    ## Order-preserving float encoding: map to biased uint64 (IEEE754), fixed-width hex
+    var bits = cast[uint64](v.f)
+    if (bits and (1'u64 shl 63)) != 0: # negative
+      bits = not bits
+    else:
+      bits = bits or (1'u64 shl 63)
+    return "F|" & toHex(bits, 16)
   of vkString:
     return "S|" & v.s
   of vkBytes:
-    return "Y|" & $v.bytes.len
+    ## Include content with length prefix encoded as hex (safe, order-preserving by content)
+    var hex = newString(v.bytes.len * 2)
+    var i = 0
+    for b in v.bytes:
+      let h = toHex(ord(b), 2)
+      hex[i] = h[0]
+      hex[i+1] = h[1]
+      i += 2
+    return "Y|" & $v.bytes.len & "|" & hex
   of vkArray:
-    return "A|" & $v.arr.len
+    ## Serialize each part recursively for stable composite ordering
+    var parts: seq[string] = @[]
+    for it in v.arr:
+      parts.add(serializePart(it))
+    return "A|" & parts.join("\x1E")
   of vkObject:
-    return "O|"
+    ## Objects are not orderable by default; use field count marker
+    return "O|" & $v.obj.len
   of vkId:
     return "D|" & v.id.collection & ":" & v.id.docId
 
@@ -58,7 +76,7 @@ proc newIndex*(name: string; fieldExpr: string): Index =
     if trimmed.len > 0:
       paths.add(trimmed.split('.'))
   let rangeable = paths.len == 1
-  Index(spec: IndexSpec(name: name, fieldPaths: paths, rangeable: rangeable), map: initTable[string, HashSet[string]](), keys: @[])
+  Index(spec: IndexSpec(name: name, fieldPaths: paths, rangeable: rangeable), map: initTable[string, HashSet[string]](), keysTree: CritBitTree[bool]())
 
 proc extractField*(doc: Value; path: seq[string]): Value =
   var cur = doc
@@ -78,13 +96,7 @@ proc extractComposite*(doc: Value; paths: seq[seq[string]]): Value =
 proc addKey(i: Index; key: string; docId: string) =
   if key notin i.map:
     i.map[key] = initHashSet[string]()
-    ## insert key in sorted order
-    var lo = 0
-    var hi = i.keys.len
-    while lo < hi:
-      let mid = (lo + hi) div 2
-      if i.keys[mid] < key: lo = mid + 1 else: hi = mid
-    i.keys.insert(key, lo)
+    i.keysTree[key] = true
   i.map[key].incl(docId)
 
 proc removeKey(i: Index; key: string; docId: string) =
@@ -92,14 +104,11 @@ proc removeKey(i: Index; key: string; docId: string) =
     i.map[key].excl(docId)
     if i.map[key].len == 0:
       i.map.del(key)
-      ## remove from sorted keys
-      var lo = 0
-      var hi = i.keys.len
-      while lo < hi:
-        let mid = (lo + hi) div 2
-        if i.keys[mid] < key: lo = mid + 1 else: hi = mid
-      if lo < i.keys.len and i.keys[lo] == key:
-        i.keys.delete(lo)
+      # rebuild keys tree from remaining keys
+      var rebuilt: CritBitTree[bool]
+      for k, _ in i.map.pairs:
+        rebuilt[k] = true
+      i.keysTree = rebuilt
 
 proc indexDoc*(i: Index; docId: string; doc: Value) =
   if doc.isNil: return
@@ -133,15 +142,18 @@ proc findRange*(i: Index; minVal: Value; maxVal: Value; inclusiveMin = true; inc
   let maxK = if maxVal.isNil: "\xFF".repeat(8) else: serializeKey(maxVal)
   result = @[]
   if asc:
-    for k in i.keys:
+    for k, _ in i.keysTree.pairs:
       if (k > minK or (inclusiveMin and k == minK)) and (k < maxK or (inclusiveMax and k == maxK)):
         for id in i.map[k].items:
           result.add(id)
           if limit > 0 and result.len >= limit: return
   else:
-    var idx = i.keys.len - 1
+    var tmpKeys: seq[string] = @[]
+    for k, _ in i.keysTree.pairs:
+      tmpKeys.add(k)
+    var idx = tmpKeys.len - 1
     while idx >= 0:
-      let k = i.keys[idx]
+      let k = tmpKeys[idx]
       if (k < maxK or (inclusiveMax and k == maxK)) and (k > minK or (inclusiveMin and k == minK)):
         for id in i.map[k].items:
           result.add(id)

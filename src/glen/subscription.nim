@@ -1,7 +1,9 @@
 # Glen subscription system
 # Allows subscribing to (collection, docId) changes.
 
-import std/[tables, locks]
+import std/[tables, locks, strutils]
+import std/streams
+import glen/codec_stream
 import glen/types
 
 type
@@ -14,13 +16,41 @@ type
   SubscriptionManager* = ref object
     lock: Lock
     subs: Table[string, SubEntry]
+    fieldSubs: Table[string, FieldSubEntry]
+    fieldDeltaSubs: Table[string, FieldDeltaSubEntry]
 
   SubscriptionHandle* = object
     key*: string
     index*: int
 
+  FieldCallback* = proc (id: Id; path: string; oldValue: Value; newValue: Value) {.closure.}
+
+  FieldSubEntry = ref object
+    key: string
+    callbacksByPath: Table[string, seq[FieldCallback]]
+
+  FieldSubscriptionHandle* = object
+    key*: string
+    path*: string
+    index*: int
+
+  FieldDeltaCallback* = proc (id: Id; path: string; deltaEvent: Value) {.closure.}
+
+  FieldDeltaSubEntry = ref object
+    key: string
+    callbacksByPath: Table[string, seq[FieldDeltaCallback]]
+
+  FieldDeltaSubscriptionHandle* = object
+    key*: string
+    path*: string
+    index*: int
+
 proc newSubscriptionManager*(): SubscriptionManager =
-  result = SubscriptionManager(subs: initTable[string, SubEntry]())
+  result = SubscriptionManager(
+    subs: initTable[string, SubEntry](),
+    fieldSubs: initTable[string, FieldSubEntry](),
+    fieldDeltaSubs: initTable[string, FieldDeltaSubEntry]()
+  )
   initLock(result.lock)
 
 proc makeKey(collection, docId: string): string = collection & ":" & docId
@@ -44,6 +74,13 @@ proc unsubscribe*(sm: SubscriptionManager; h: SubscriptionHandle) =
     var entry = sm.subs[h.key]
     if h.index >= 0 and h.index < entry.callbacks.len:
       entry.callbacks[h.index] = nil
+      # Compact when too many nils; drop entry if empty
+      var newCbs: seq[SubscriberCallback] = @[]
+      for cb in entry.callbacks:
+        if cb != nil: newCbs.add(cb)
+      entry.callbacks = newCbs
+      if entry.callbacks.len == 0:
+        sm.subs.del(h.key)
   release(sm.lock)
 
 proc notify*(sm: SubscriptionManager; id: Id; newValue: Value) =
@@ -57,3 +94,151 @@ proc notify*(sm: SubscriptionManager; id: Id; newValue: Value) =
   release(sm.lock)
   for cb in callbacks:
     cb(id, newValue)
+
+## Subscribe and stream updates as framed events into the provided Stream.
+## Each event is a Value object encoded via encodeTo with fields:
+## { collection: string, docId: string, version: uint64, value: Value }
+proc subscribeStream*(sm: SubscriptionManager; collection, docId: string; s: Stream): SubscriptionHandle =
+  let cb = proc (id: Id; newValue: Value) {.closure.} =
+    var ev = VObject()
+    ev["collection"] = VString(id.collection)
+    ev["docId"] = VString(id.docId)
+    ev["version"] = VInt(int64(id.version))
+    ev["value"] = if newValue.isNil: VNull() else: newValue
+    encodeTo(s, ev)
+  result = sm.subscribe(collection, docId, cb)
+
+proc subscribeField*(sm: SubscriptionManager; collection, docId: string; fieldPath: string; cb: FieldCallback): FieldSubscriptionHandle =
+  acquire(sm.lock)
+  let key = makeKey(collection, docId)
+  if key notin sm.fieldSubs:
+    sm.fieldSubs[key] = FieldSubEntry(key: key, callbacksByPath: initTable[string, seq[FieldCallback]]())
+  if fieldPath notin sm.fieldSubs[key].callbacksByPath:
+    sm.fieldSubs[key].callbacksByPath[fieldPath] = @[]
+  sm.fieldSubs[key].callbacksByPath[fieldPath].add(cb)
+  let idx = sm.fieldSubs[key].callbacksByPath[fieldPath].len - 1
+  release(sm.lock)
+  result = FieldSubscriptionHandle(key: key, path: fieldPath, index: idx)
+
+proc unsubscribeField*(sm: SubscriptionManager; h: FieldSubscriptionHandle) =
+  acquire(sm.lock)
+  if h.key in sm.fieldSubs and h.path in sm.fieldSubs[h.key].callbacksByPath:
+    var seqRef = sm.fieldSubs[h.key].callbacksByPath[h.path]
+    if h.index >= 0 and h.index < seqRef.len:
+      seqRef[h.index] = nil
+    # compact path callbacks
+    var newCbs: seq[FieldCallback] = @[]
+    for cb in seqRef:
+      if cb != nil: newCbs.add(cb)
+    if newCbs.len == 0:
+      sm.fieldSubs[h.key].callbacksByPath.del(h.path)
+      if sm.fieldSubs[h.key].callbacksByPath.len == 0:
+        sm.fieldSubs.del(h.key)
+    else:
+      sm.fieldSubs[h.key].callbacksByPath[h.path] = newCbs
+  release(sm.lock)
+
+proc getFieldByPath(v: Value; fieldPath: string): Value =
+  if v.isNil: return nil
+  var cur = v
+  for p in fieldPath.split('.'):
+    if cur.isNil or cur.kind != vkObject: return nil
+    cur = cur[p]
+  return cur
+
+proc notifyFieldChanges*(sm: SubscriptionManager; id: Id; oldDoc, newDoc: Value) =
+  let key = makeKey(id.collection, id.docId)
+  var toCall: seq[(FieldCallback, string, Value, Value)] = @[]
+  var toDeltaCall: seq[(FieldDeltaCallback, string, Value)] = @[]
+  acquire(sm.lock)
+  if key in sm.fieldSubs:
+    for path, cbs in sm.fieldSubs[key].callbacksByPath.pairs:
+      let oldV = getFieldByPath(oldDoc, path)
+      let newV = getFieldByPath(newDoc, path)
+      if oldV == newV:
+        continue
+      for cb in cbs:
+        if cb != nil:
+          toCall.add((cb, path, oldV, newV))
+  if key in sm.fieldDeltaSubs:
+    for path, cbs in sm.fieldDeltaSubs[key].callbacksByPath.pairs:
+      let oldV = getFieldByPath(oldDoc, path)
+      let newV = getFieldByPath(newDoc, path)
+      if oldV == newV:
+        continue
+      # Build delta event Value with a simple schema:
+      # { kind: "append"|"replace"|"delete"|"set", added?: Value, old?: Value, new?: Value }
+      var ev = VObject()
+      if oldV.isNil and not newV.isNil:
+        ev["kind"] = VString("set")
+        ev["new"] = newV
+      elif not oldV.isNil and newV.isNil:
+        ev["kind"] = VString("delete")
+        ev["old"] = oldV
+      elif oldV.kind == vkString and newV.kind == vkString and newV.s.startsWith(oldV.s):
+        ev["kind"] = VString("append")
+        ev["added"] = VString(newV.s[oldV.s.len ..< newV.s.len])
+      else:
+        ev["kind"] = VString("replace")
+        ev["old"] = oldV
+        ev["new"] = newV
+      for cb in cbs:
+        if cb != nil:
+          toDeltaCall.add((cb, path, ev))
+  release(sm.lock)
+  for (cb, path, o, n) in toCall:
+    cb(id, path, o, n)
+  for (cb, path, ev) in toDeltaCall:
+    cb(id, path, ev)
+
+proc subscribeFieldStream*(sm: SubscriptionManager; collection, docId: string; fieldPath: string; s: Stream): FieldSubscriptionHandle =
+  let cb = proc (id: Id; path: string; oldValue: Value; newValue: Value) {.closure.} =
+    var ev = VObject()
+    ev["collection"] = VString(id.collection)
+    ev["docId"] = VString(id.docId)
+    ev["version"] = VInt(int64(id.version))
+    ev["fieldPath"] = VString(path)
+    ev["old"] = if oldValue.isNil: VNull() else: oldValue
+    ev["new"] = if newValue.isNil: VNull() else: newValue
+    encodeTo(s, ev)
+  result = sm.subscribeField(collection, docId, fieldPath, cb)
+
+proc subscribeFieldDelta*(sm: SubscriptionManager; collection, docId: string; fieldPath: string; cb: FieldDeltaCallback): FieldDeltaSubscriptionHandle =
+  acquire(sm.lock)
+  let key = makeKey(collection, docId)
+  if key notin sm.fieldDeltaSubs:
+    sm.fieldDeltaSubs[key] = FieldDeltaSubEntry(key: key, callbacksByPath: initTable[string, seq[FieldDeltaCallback]]())
+  if fieldPath notin sm.fieldDeltaSubs[key].callbacksByPath:
+    sm.fieldDeltaSubs[key].callbacksByPath[fieldPath] = @[]
+  sm.fieldDeltaSubs[key].callbacksByPath[fieldPath].add(cb)
+  let idx = sm.fieldDeltaSubs[key].callbacksByPath[fieldPath].len - 1
+  release(sm.lock)
+  result = FieldDeltaSubscriptionHandle(key: key, path: fieldPath, index: idx)
+
+proc unsubscribeFieldDelta*(sm: SubscriptionManager; h: FieldDeltaSubscriptionHandle) =
+  acquire(sm.lock)
+  if h.key in sm.fieldDeltaSubs and h.path in sm.fieldDeltaSubs[h.key].callbacksByPath:
+    var seqRef = sm.fieldDeltaSubs[h.key].callbacksByPath[h.path]
+    if h.index >= 0 and h.index < seqRef.len:
+      seqRef[h.index] = nil
+    var newCbs: seq[FieldDeltaCallback] = @[]
+    for cb in seqRef:
+      if cb != nil: newCbs.add(cb)
+    if newCbs.len == 0:
+      sm.fieldDeltaSubs[h.key].callbacksByPath.del(h.path)
+      if sm.fieldDeltaSubs[h.key].callbacksByPath.len == 0:
+        sm.fieldDeltaSubs.del(h.key)
+    else:
+      sm.fieldDeltaSubs[h.key].callbacksByPath[h.path] = newCbs
+  release(sm.lock)
+
+proc subscribeFieldDeltaStream*(sm: SubscriptionManager; collection, docId: string; fieldPath: string; s: Stream): FieldDeltaSubscriptionHandle =
+  let cb = proc (id: Id; path: string; deltaEvent: Value) {.closure.} =
+    var ev = VObject()
+    ev["collection"] = VString(id.collection)
+    ev["docId"] = VString(id.docId)
+    ev["version"] = VInt(int64(id.version))
+    ev["fieldPath"] = VString(path)
+    ev["delta"] = deltaEvent
+    encodeTo(s, ev)
+  result = sm.subscribeFieldDelta(collection, docId, fieldPath, cb)
