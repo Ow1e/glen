@@ -128,12 +128,15 @@ proc totalSize*(wal: WriteAheadLog): int =
   while true:
     let path = segmentPath(wal.dir, idx)
     if not fileExists(path): break
-    try:
-      let f = open(path, fmRead)
-      sum += int(f.getFileSize())
-      f.close()
-    except IOError:
-      discard
+    if idx == wal.currentIndex:
+      sum += wal.currentSize
+    else:
+      try:
+        let f = open(path, fmRead)
+        sum += int(f.getFileSize())
+        f.close()
+      except IOError:
+        discard
     inc idx
   sum
 
@@ -179,6 +182,50 @@ proc append*(wal: WriteAheadLog; rec: WalRecord) =
     wal.bytesSinceFlush = 0
   of wsmInterval:
     wal.bytesSinceFlush += written
+    if wal.bytesSinceFlush >= wal.flushEveryBytes:
+      wal.fs.flushFile()
+      wal.bytesSinceFlush = 0
+  of wsmNone:
+    discard
+
+proc appendMany*(wal: WriteAheadLog; recs: openArray[WalRecord]) =
+  var totalWritten = 0
+  for rec in recs:
+    var ms = newStringStream()
+    writeVarUint(ms, uint64(rec.kind.ord))
+    writeVarUint(ms, uint64(rec.collection.len)); ms.write(rec.collection)
+    writeVarUint(ms, uint64(rec.docId.len)); ms.write(rec.docId)
+    ms.write(rec.version)
+    if rec.kind == wrPut:
+      let payload = encode(rec.value)
+      writeVarUint(ms, uint64(payload.len))
+      ms.write(payload)
+    else:
+      writeVarUint(ms, 0)
+
+    let body = ms.data
+    let crc = fnv1a32(body)
+    var header = newStringStream()
+    writeVarUint(header, uint64(body.len))
+    let headerStr = header.data
+    wal.rotateIfNeeded(headerStr.len + 4 + body.len)
+    wal.fs.write(headerStr)
+    var csBuf: array[4, byte]
+    csBuf[0] = byte(crc and 0xFF)
+    csBuf[1] = byte((crc shr 8) and 0xFF)
+    csBuf[2] = byte((crc shr 16) and 0xFF)
+    csBuf[3] = byte((crc shr 24) and 0xFF)
+    discard wal.fs.writeBuffer(addr csBuf[0], 4)
+    wal.fs.write(body)
+    wal.currentSize += headerStr.len + 4 + body.len
+    totalWritten += headerStr.len + 4 + body.len
+
+  case wal.syncMode
+  of wsmAlways:
+    wal.fs.flushFile()
+    wal.bytesSinceFlush = 0
+  of wsmInterval:
+    wal.bytesSinceFlush += totalWritten
     if wal.bytesSinceFlush >= wal.flushEveryBytes:
       wal.fs.flushFile()
       wal.bytesSinceFlush = 0

@@ -6,6 +6,8 @@
   - [ ] Add WAL archival/rotation policy and size-based retention
   - [ ] Build crash/recovery stress test harness (power-failure simulation)
   - [ ] Benchmarks for recovery time and durability trade-offs
+  - [x] Default to interval WAL sync with tunable flush window
+  - [x] Expose runtime WAL sync tuning via `db.setWalSync`
 
 - [ ] Bounds and input validation
   - [ ] Make max sizes configurable (env/config) rather than constants
@@ -21,10 +23,12 @@
   - [x] Fix stale index entries on updates (reindex old->new) and deletes
   - [x] Ensure WAL replay delete unindexes using prior document
   - [ ] Add contention/throughput tests with mixed readers/writers
+  - [x] Reader-prefer RW lock policy for read-heavy workloads
 
 -- [ ] Transaction correctness
   - [x] Return clones from reads to prevent external mutation of store values
   - [ ] Property tests for isolation (no phantom writes/reads) and version monotonicity
+  - [x] Use tuple keys for `Txn.writes` to avoid string splits
 
 - [ ] API ergonomics and safety
   - [ ] JSON bridging (encode/decode) helpers
@@ -33,6 +37,7 @@
   - [x] Field-level subscriptions (callbacks and streams)
   - [x] Delta field subscriptions (append/replace/delete/set) with streaming
   - [ ] Backpressure/buffering options for streaming notifications
+  - [x] Borrowed read APIs (return refs): `getBorrowed*` variants
 
 - [ ] Storage and snapshots
   - [x] Write snapshots atomically (`.tmp` + rename) and fsync the file and directory (best-effort on Windows).
@@ -50,7 +55,9 @@
   - [ ] Replace sorted-seq index `keys` with tree/B-tree to avoid O(n) inserts
   - [ ] Optional payload compression (e.g., zstd) for WAL segments after correctness is solid.
   - [ ] Microbenchmarks (encode/decode, get/put, commit) and perf CI gate
-  - [ ] Cache metrics (hit/miss/evictions) and adaptive tuning hooks
+  - [x] Sharded LRU cache with per-shard locks; configurable shard count
+  - [x] Cache metrics (hit/miss/evictions) per-shard and aggregate
+  - [x] Batch WAL appends in commit to reduce flushes/syscalls
 
 - [ ] Testing
   - [x] WAL replay, including partial/corrupt tail handling.
@@ -73,6 +80,7 @@
   - [x] CI across Linux and Windows; test Nim 1.6 and 2.x (ARC/ORC).
   - [ ] Publish docs (GitHub Pages) and add CONTRIBUTING.md
   - [ ] Add CHANGELOG and versioning/release notes process
+  - [x] Author WHITEPAPER.md detailing architecture, performance, and use cases
 
 - [ ] Housekeeping
   - [x] Remove the placeholder guard in `src/glen/glen.nim` (`when not declared(Value)`).

@@ -1,6 +1,6 @@
 # Glen adaptive LRU cache for documents
 
-import std/[tables, locks]
+import std/[tables, locks, hashes]
 import glen/types
 
 type
@@ -10,35 +10,54 @@ type
     prev, next: CacheEntry
     size: int
 
-  LruCache* = ref object
+  CacheShard = ref object
     map: Table[string, CacheEntry]
     head, tail: CacheEntry
-    capacity*: int
+    capacity: int
     current: int
     lock: Lock
+    hits: int
+    misses: int
+    puts: int
+    evictions: int
+
+  LruCache* = ref object
+    shards: seq[CacheShard]
+    capacity*: int
     hits*: int
     misses*: int
     puts*: int
     evictions*: int
 
-proc newLruCache*(capacity: int): LruCache =
-  result = LruCache(map: initTable[string, CacheEntry](), capacity: capacity)
+proc makeShard(capacity: int): CacheShard =
+  result = CacheShard(map: initTable[string, CacheEntry](), capacity: capacity)
   initLock(result.lock)
 
-proc removeNode(c: LruCache; e: CacheEntry) =
+proc newLruCache*(capacity: int; numShards: int = 1): LruCache =
+  var shardsCount = if numShards <= 0: 1 else: numShards
+  result = LruCache(capacity: capacity)
+  result.shards.setLen(shardsCount)
+  let baseCap = capacity div shardsCount
+  var rem = capacity - baseCap * shardsCount
+  for i in 0 ..< shardsCount:
+    let cap = baseCap + (if rem > 0: 1 else: 0)
+    if rem > 0: dec rem
+    result.shards[i] = makeShard(cap)
+
+proc removeNode(c: CacheShard; e: CacheEntry) =
   if e.prev != nil: e.prev.next = e.next
   if e.next != nil: e.next.prev = e.prev
   if c.head == e: c.head = e.next
   if c.tail == e: c.tail = e.prev
   e.prev = nil; e.next = nil
 
-proc addFront(c: LruCache; e: CacheEntry) =
+proc addFront(c: CacheShard; e: CacheEntry) =
   e.next = c.head
   if c.head != nil: c.head.prev = e
   c.head = e
   if c.tail == nil: c.tail = e
 
-proc touch(c: LruCache; e: CacheEntry) =
+proc touch(c: CacheShard; e: CacheEntry) =
   removeNode(c, e); addFront(c, e)
 
 proc estimateSize(v: Value): int =
@@ -59,54 +78,101 @@ proc estimateSize(v: Value): int =
     s
   of vkId: 32 + v.id.collection.len + v.id.docId.len
 
+proc chooseShard(c: LruCache; key: string): CacheShard =
+  let h = abs(hash(key).int)
+  c.shards[h mod c.shards.len]
+
 proc get*(c: LruCache; key: string): Value =
-  acquire(c.lock)
-  defer: release(c.lock)
-  if key in c.map:
-    let e = c.map[key]
-    c.touch(e)
-    inc c.hits
+  let s = c.chooseShard(key)
+  acquire(s.lock)
+  defer: release(s.lock)
+  if key in s.map:
+    let e = s.map[key]
+    s.touch(e)
+    inc s.hits; inc c.hits
     return e.value
-  inc c.misses
+  inc s.misses; inc c.misses
 
 proc put*(c: LruCache; key: string; value: Value) =
-  acquire(c.lock)
-  defer: release(c.lock)
+  let s = c.chooseShard(key)
+  acquire(s.lock)
+  defer: release(s.lock)
   let size = estimateSize(value)
-  if key in c.map:
-    let e = c.map[key]
-    c.current -= e.size
+  if key in s.map:
+    let e = s.map[key]
+    s.current -= e.size
     e.value = value; e.size = size
-    c.current += size
-    c.touch(e)
+    s.current += size
+    s.touch(e)
   else:
     let e = CacheEntry(key: key, value: value, size: size)
-    c.map[key] = e
-    c.addFront(e)
-    c.current += size
-    inc c.puts
-  while c.current > c.capacity and c.tail != nil:
-    let victim = c.tail
-    c.removeNode(victim)
-    c.map.del(victim.key)
-    c.current -= victim.size
-    inc c.evictions
+    s.map[key] = e
+    s.addFront(e)
+    s.current += size
+    inc s.puts; inc c.puts
+  while s.current > s.capacity and s.tail != nil:
+    let victim = s.tail
+    s.removeNode(victim)
+    s.map.del(victim.key)
+    s.current -= victim.size
+    inc s.evictions; inc c.evictions
 
 proc adjustCapacity*(c: LruCache; newCap: int) =
-  acquire(c.lock)
-  defer: release(c.lock)
   c.capacity = newCap
-  while c.current > c.capacity and c.tail != nil:
-    let victim = c.tail
-    c.removeNode(victim)
-    c.map.del(victim.key)
-    c.current -= victim.size
+  let shardsCount = c.shards.len
+  let baseCap = newCap div shardsCount
+  var rem = newCap - baseCap * shardsCount
+  for s in c.shards.mitems:
+    acquire(s.lock)
+    s.capacity = baseCap + (if rem > 0: 1 else: 0)
+    if rem > 0: dec rem
+    while s.current > s.capacity and s.tail != nil:
+      let victim = s.tail
+      s.removeNode(victim)
+      s.map.del(victim.key)
+      s.current -= victim.size
+    release(s.lock)
 
 proc del*(c: LruCache; key: string) =
-  acquire(c.lock)
-  defer: release(c.lock)
-  if key in c.map:
-    let e = c.map[key]
-    c.removeNode(e)
-    c.current -= e.size
-    c.map.del(key)
+  let s = c.chooseShard(key)
+  acquire(s.lock)
+  defer: release(s.lock)
+  if key in s.map:
+    let e = s.map[key]
+    s.removeNode(e)
+    s.current -= e.size
+    s.map.del(key)
+
+type CacheShardStats* = object
+  entries*: int
+  current*: int
+  capacity*: int
+  hits*: int
+  misses*: int
+  puts*: int
+  evictions*: int
+
+type CacheStats* = object
+  shards*: seq[CacheShardStats]
+  totalCapacity*: int
+  totalCurrent*: int
+  hits*: int
+  misses*: int
+  puts*: int
+  evictions*: int
+
+proc stats*(c: LruCache): CacheStats =
+  result.totalCapacity = c.capacity
+  result.hits = c.hits
+  result.misses = c.misses
+  result.puts = c.puts
+  result.evictions = c.evictions
+  result.shards = @[]
+  var totalCur = 0
+  for s in c.shards:
+    acquire(s.lock)
+    let st = CacheShardStats(entries: s.map.len, current: s.current, capacity: s.capacity, hits: s.hits, misses: s.misses, puts: s.puts, evictions: s.evictions)
+    release(s.lock)
+    totalCur += st.current
+    result.shards.add(st)
+  result.totalCurrent = totalCur

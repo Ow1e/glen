@@ -23,13 +23,13 @@ type
 
 ## Create or open a Glen database at the given directory.
 ## Loads snapshots, replays the WAL, and initializes cache and subscriptions.
-proc newGlenDB*(dir: string; cacheCapacity = 4*1024*1024; walSync: WalSyncMode = wsmAlways): GlenDB =
+proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; walSync: WalSyncMode = wsmInterval; walFlushEveryBytes = 8*1024*1024): GlenDB =
   result = GlenDB(
     dir: dir,
-    wal: openWriteAheadLog(dir, syncMode = walSync),
+    wal: openWriteAheadLog(dir, syncMode = walSync, flushEveryBytes = walFlushEveryBytes),
     collections: initTable[string, CollectionStore](),
     versions: initTable[string, Table[string, uint64]](),
-    cache: newLruCache(cacheCapacity),
+    cache: newLruCache(cacheCapacity, numShards = cacheShards),
     subs: newSubscriptionManager(),
     indexes: initTable[string, IndexesByName]()
   )
@@ -82,6 +82,20 @@ proc get*(db: GlenDB; collection, docId: string): Value =
     return cloned
   releaseRead(db.rw)
 
+# Borrowed (non-cloned) read. Caller must not mutate returned Value.
+proc getBorrowed*(db: GlenDB; collection, docId: string): Value =
+  let key = collection & ":" & docId
+  let cached = db.cache.get(key)
+  if cached != nil:
+    return cached
+  acquireRead(db.rw)
+  if collection in db.collections and docId in db.collections[collection]:
+    let v = db.collections[collection][docId]
+    db.cache.put(key, v)
+    releaseRead(db.rw)
+    return v
+  releaseRead(db.rw)
+
 # Transaction-aware read: records version for OCC
 ## Transaction-aware get. Records the version read into the provided transaction
 ## for optimistic concurrency control.
@@ -119,6 +133,28 @@ proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(s
         result.add((id, v.clone()))
   releaseRead(db.rw)
 
+## Borrowed batch get: returns refs without cloning. Caller must not mutate.
+proc getBorrowedMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(string, Value)] =
+  result = @[]
+  var missing: seq[string] = @[]
+  for id in docIds:
+    let key = collection & ":" & id
+    let cached = db.cache.get(key)
+    if cached != nil:
+      result.add((id, cached))
+    else:
+      missing.add(id)
+  if missing.len == 0: return
+  acquireRead(db.rw)
+  if collection in db.collections:
+    let coll = db.collections[collection]
+    for id in missing:
+      if id in coll:
+        let v = coll[id]
+        db.cache.put(collection & ":" & id, v)
+        result.add((id, v))
+  releaseRead(db.rw)
+
 ## Transaction-aware batch get. Records read versions for OCC.
 proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]; t: Txn): seq[(string, Value)] =
   let pairs = db.getMany(collection, docIds)
@@ -137,6 +173,16 @@ proc getAll*(db: GlenDB; collection: string): seq[(string, Value)] =
     for id, v in db.collections[collection]:
       db.cache.put(collection & ":" & id, v)
       result.add((id, v.clone()))
+  releaseRead(db.rw)
+
+## Borrowed getAll: returns refs without cloning. Caller must not mutate.
+proc getBorrowedAll*(db: GlenDB; collection: string): seq[(string, Value)] =
+  result = @[]
+  acquireRead(db.rw)
+  if collection in db.collections:
+    for id, v in db.collections[collection]:
+      db.cache.put(collection & ":" & id, v)
+      result.add((id, v))
   releaseRead(db.rw)
 
 ## Transaction-aware getAll. Records read versions for all returned docs.
@@ -238,16 +284,14 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       releaseWrite(db.rw)
       return CommitResult(status: csConflict, message: "Version mismatch for " & k)
   # apply writes
-  for k, w in t.writes:
-    let parts = k.split(":")
-    if parts.len != 2:
-      continue
-    let collection = parts[0]
-    let docId = parts[1]
+  var walRecs: seq[WalRecord] = @[]
+  for key, w in t.writes:
+    let collection = key[0]
+    let docId = key[1]
     if w.kind == twDelete:
       if collection in db.collections and docId in db.collections[collection]:
         let newVer = db.currentVersion(collection, docId) + 1
-        db.wal.append(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: newVer))
+        walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: newVer))
         var oldDoc = db.collections[collection][docId]
         if collection in db.indexes:
           for _, idx in db.indexes[collection]:
@@ -262,7 +306,7 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       if collection notin db.collections:
         db.collections[collection] = initTable[string, Value]()
       let newVer = db.currentVersion(collection, docId) + 1
-      db.wal.append(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: w.value))
+      walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: w.value))
       var oldDoc: Value = nil
       if collection in db.collections and docId in db.collections[collection]:
         oldDoc = db.collections[collection][docId]
@@ -276,6 +320,8 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
           idx.reindexDoc(docId, oldDoc, w.value)
       notifications.add((Id(collection: collection, docId: docId, version: newVer), w.value))
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
+  if walRecs.len > 0:
+    db.wal.appendMany(walRecs)
   t.state = tsCommitted
   releaseWrite(db.rw)
   for it in notifications:
@@ -385,4 +431,13 @@ proc close*(db: GlenDB) =
   defer: releaseWrite(db.rw)
   if db.wal != nil:
     db.wal.close()
+
+proc cacheStats*(db: GlenDB): CacheStats =
+  db.cache.stats()
+
+proc setWalSync*(db: GlenDB; mode: WalSyncMode; flushEveryBytes = 0) =
+  acquireWrite(db.rw)
+  defer: releaseWrite(db.rw)
+  if db.wal != nil:
+    db.wal.setSyncPolicy(mode, flushEveryBytes)
 

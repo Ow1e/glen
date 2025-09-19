@@ -24,10 +24,10 @@ type
   Txn* = ref object
     state*: TxnState
     readVersions*: Table[string, uint64]   # key -> version observed
-    writes*: Table[string, TxnWrite]       # key -> write op
+    writes*: Table[(string, string), TxnWrite]       # (collection, docId) -> write op
 
 proc newTxn*(): Txn =
-  Txn(state: tsActive, readVersions: initTable[string, uint64](), writes: initTable[string, TxnWrite]())
+  Txn(state: tsActive, readVersions: initTable[string, uint64](), writes: initTable[(string, string), TxnWrite]())
 
 proc assertActive(t: Txn) =
   if t.state != tsActive: raise newException(ValueError, "Transaction not active")
@@ -42,13 +42,11 @@ proc recordRead*(t: Txn; id: Id) =
 
 proc stagePut*(t: Txn; id: Id; value: Value) =
   assertActive(t)
-  let k = keyFor(id.collection, id.docId)
-  t.writes[k] = TxnWrite(kind: twPut, value: value)
+  t.writes[(id.collection, id.docId)] = TxnWrite(kind: twPut, value: value)
 
 proc stageDelete*(t: Txn; collection, docId: string) =
   assertActive(t)
-  let k = keyFor(collection, docId)
-  t.writes[k] = TxnWrite(kind: twDelete)
+  t.writes[(collection, docId)] = TxnWrite(kind: twDelete)
 
 proc rollback*(t: Txn) =
   assertActive(t); t.state = tsRolledBack

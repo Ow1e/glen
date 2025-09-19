@@ -19,7 +19,8 @@ proc initRwLock*(rw: var RwLock) =
 
 proc acquireRead*(rw: var RwLock) =
   acquire(rw.m)
-  while rw.writer or rw.writersWaiting > 0:
+  # Reader-prefer: allow readers unless a writer is active
+  while rw.writer:
     wait(rw.readersCond, rw.m)
   inc rw.readers
   release(rw.m)
