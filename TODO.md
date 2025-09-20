@@ -52,7 +52,9 @@
   - [x] Reduce allocations in the codec by reusing buffers; optionally add a streaming encode/decode API.
   - [x] Pre-size `seq`/tables consistently when counts are known.
   - [x] Order-preserving index keys for floats; deterministic keying for bytes/arrays
-  - [ ] Replace sorted-seq index `keys` with tree/B-tree to avoid O(n) inserts
+  - [x] Replace sorted-seq index `keys` with tree/B-tree to avoid O(n) inserts
+    - Implemented ordered keys via `CritBitTree`; deletions use `excl` (no rebuild)
+    - Optimized range scan to early-continue/break based on bounds
   - [ ] Optional payload compression (e.g., zstd) for WAL segments after correctness is solid.
   - [ ] Microbenchmarks (encode/decode, get/put, commit) and perf CI gate
   - [x] Sharded LRU cache with per-shard locks; configurable shard count

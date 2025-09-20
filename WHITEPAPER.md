@@ -82,6 +82,8 @@ Non-goals (for now):
 ### 3.7 Indexes
 - Equality and range (single-field) support; composite equality via serialized composite keys.
 - Internals: `Table[string, HashSet[string]]` for postings; `CritBitTree` for ordered range keys.
+  - Ordered key maintenance is O(log n) for insert/update/delete. Deletes use `excl` on the critbit tree (no full rebuild).
+  - Range scans are O(log n + m), where m is the number of results returned. Ascending scans iterate the critbit tree directly; descending scans materialize keys temporarily for reverse traversal.
 - Maintenance: On put/delete/commit, indexes update by (re)indexing affected docs.
 
 ### 3.8 Codec

@@ -13,6 +13,7 @@ Glen is a wickedly fast embedded in-memory document database written in Nim. It 
 - Indexing and queries:
   - Equality indexes (single-field and composite keys)
   - Range scans (single-field), orderBy (asc/desc), and limit
+  - Ordered keys backed by CritBitTree for O(log n) maintenance and efficient range scans
 
 > Status: Stable Beta (0.2.0) — Still a WIP
 

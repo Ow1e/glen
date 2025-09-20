@@ -104,11 +104,7 @@ proc removeKey(i: Index; key: string; docId: string) =
     i.map[key].excl(docId)
     if i.map[key].len == 0:
       i.map.del(key)
-      # rebuild keys tree from remaining keys
-      var rebuilt: CritBitTree[bool]
-      for k, _ in i.map.pairs:
-        rebuilt[k] = true
-      i.keysTree = rebuilt
+      i.keysTree.excl(key)
 
 proc indexDoc*(i: Index; docId: string; doc: Value) =
   if doc.isNil: return
@@ -143,10 +139,13 @@ proc findRange*(i: Index; minVal: Value; maxVal: Value; inclusiveMin = true; inc
   result = @[]
   if asc:
     for k, _ in i.keysTree.pairs:
-      if (k > minK or (inclusiveMin and k == minK)) and (k < maxK or (inclusiveMax and k == maxK)):
-        for id in i.map[k].items:
-          result.add(id)
-          if limit > 0 and result.len >= limit: return
+      if k < minK or (k == minK and not inclusiveMin):
+        continue
+      if k > maxK or (k == maxK and not inclusiveMax):
+        break
+      for id in i.map[k].items:
+        result.add(id)
+        if limit > 0 and result.len >= limit: return
   else:
     var tmpKeys: seq[string] = @[]
     for k, _ in i.keysTree.pairs:
@@ -154,10 +153,15 @@ proc findRange*(i: Index; minVal: Value; maxVal: Value; inclusiveMin = true; inc
     var idx = tmpKeys.len - 1
     while idx >= 0:
       let k = tmpKeys[idx]
-      if (k < maxK or (inclusiveMax and k == maxK)) and (k > minK or (inclusiveMin and k == minK)):
-        for id in i.map[k].items:
-          result.add(id)
-          if limit > 0 and result.len >= limit: return
+      if k > maxK or (k == maxK and not inclusiveMax):
+        if idx == 0: break
+        dec idx
+        continue
+      if k < minK or (k == minK and not inclusiveMin):
+        break
+      for id in i.map[k].items:
+        result.add(id)
+        if limit > 0 and result.len >= limit: return
       if idx == 0: break
       dec idx
 
