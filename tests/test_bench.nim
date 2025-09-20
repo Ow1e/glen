@@ -66,7 +66,7 @@ proc benchTxn(db: glendb.GlenDB; N: int) =
 when isMainModule:
   let dir = getTempDir() / "glen_bench_db"
   if dirExists(dir): removeDir(dir)
-  let database = newGlenDB(dir, cacheCapacity = 128*1024*1024, cacheShards = 32, walSync = wsmInterval, walFlushEveryBytes = 8*1024*1024, lockStripesCount = 64)
+  let database = newGlenDB(dir, cacheCapacity = 128*1024*1024, cacheShards = 32, walFlushEveryBytes = 8*1024*1024, lockStripesCount = 64)
   let N = 20000
   var keys: seq[string] = newSeq[string](N)
   for i in 0 ..< N: keys[i] = "k" & $i
@@ -74,7 +74,7 @@ when isMainModule:
   benchPut(database, N, keys)
   # Close and reopen so read benches run against a cold cache
   database.close()
-  let database2 = newGlenDB(dir, cacheCapacity = 128*1024*1024, cacheShards = 32, walSync = wsmInterval, walFlushEveryBytes = 8*1024*1024, lockStripesCount = 64)
+  let database2 = newGlenDB(dir, cacheCapacity = 128*1024*1024, cacheShards = 32, walFlushEveryBytes = 8*1024*1024, lockStripesCount = 64)
 
   benchGet(database2, N, keys)
   benchGetBorrowed(database2, N, keys)
