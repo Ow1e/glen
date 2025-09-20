@@ -209,10 +209,7 @@ let db = newGlenDB("./mydb", cacheCapacity = 128*1024*1024, cacheShards = 32, lo
 ```
 
 Transactions spanning multiple collections lock the needed stripes in a fixed order to avoid deadlocks.
-```
-
-Note: On Windows, directory metadata is flushed when new WAL segments or snapshots are created. On POSIX, standard file flush is used.
-```
+**Note: On Windows, directory metadata is flushed when new WAL segments or snapshots are created. On POSIX, standard file flush is used.**
 
 ## Multi-Master Replication (see multi-comm branch)
 
