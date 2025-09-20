@@ -82,19 +82,15 @@ echo res.status                           # csOk or csConflict
 ```
 ### Borrowed reads (no clone)
 
-Borrowed variants return shared references for performance. Do not mutate the returned `Value`.
+Borrowed variants return shared references for performance. Do not mutate the returned `Value`. Ideal for read-only hot paths.
 
 ```nim
 let vRef = db.getBorrowed("users", "u1")
-for (id, v) in db.getBorrowedMany("users", @["u1", "u2"]): discard
+for (id, v) in db.getBorrowedMany("users", @[["u1", "u2"]]): discard
 for (id, v) in db.getBorrowedAll("users"): discard
 ```
-
-These are ideal for read-only hot paths where you control immutability.
-
-```
-
 ### Subscriptions
+
 
 ```nim
 import glen/types, glen/db
@@ -216,6 +212,40 @@ Transactions spanning multiple collections lock the needed stripes in a fixed or
 ```
 
 Note: On Windows, directory metadata is flushed when new WAL segments or snapshots are created. On POSIX, standard file flush is used.
+```
+
+## Multi-Master Replication (see multi-comm branch)
+
+Glen provides a transport-agnostic API for multi-master sync. You wire the transport; Glen handles filtering, idempotency, and conflict resolution (HLC-based LWW).
+
+- Change export (filterable):
+  - `exportChanges(sinceCursor, includeCollections = @[], excludeCollections = @[]) -> (nextCursor, changes)`
+  - If `includeCollections` is non-empty, only those are sent. Collections in `excludeCollections` are omitted.
+- Apply changes (idempotent, LWW):
+  - `applyChanges(changes)` updates local state, indexes, cache, and fires subscriptions.
+- Node identity (optional):
+  - Set `GLEN_NODE_ID` to a stable node id; otherwise one is generated.
+
+Minimal flow (peer-to-peer):
+
+```nim
+# On sender (A)
+var cursorForB: uint64 = 0
+let (nextCursor, batch) = dbA.exportChanges(cursorForB, includeCollections = @("users"))  # you choose filters
+# send `batch` to B via your transport
+
+# On receiver (B)
+dbB.applyChanges(batch)
+# On sender (A)
+cursorForB = nextCursor  # persist per-peer cursor
+```
+
+Bootstrap a new node (B):
+- Choose collections B wants; copy snapshots for those collections (or send a bulk dump).
+- Initialize B, load snapshots, then start tailing A with exportChanges from an agreed cursor using the same filters.
+
+Topologies:
+- Full mesh or hub/spoke; keep one export cursor per peer. Changes can traverse multiple hops; duplicates are ignored and conflicts converge via LWW.
 
 ## Binary formats
 
