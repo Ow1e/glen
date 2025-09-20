@@ -1,6 +1,6 @@
 # Glen
 
-Glen is a wickedly fast embedded document database written in Nim. It offers:
+Glen is a wickedly fast embedded in-memory document database written in Nim. It offers:
 
 - Convex-like rich value types
 - Durable write-ahead log with per-record checksums and segment headers
@@ -14,7 +14,7 @@ Glen is a wickedly fast embedded document database written in Nim. It offers:
   - Equality indexes (single-field and composite keys)
   - Range scans (single-field), orderBy (asc/desc), and limit
 
-> Status: Prototype (0.1.0) — Work in progress.
+> Status: Stable Beta (0.2.0) — Still a WIP
 
 ## Roadmap
 
