@@ -1,9 +1,10 @@
 # Glen DB high-level API
 
-import std/[os, tables, locks, strutils, streams]
+import std/[os, tables, locks, strutils, streams, hashes, algorithm]
 import glen/types, glen/wal, glen/storage, glen/cache, glen/subscription, glen/txn
 import glen/rwlock
 import glen/index
+import glen/config
 
 # In-memory store: collection -> (docId -> Value)
 
@@ -20,10 +21,11 @@ type
     indexes: Table[string, IndexesByName]          # collection -> name -> Index
     lock: Lock
     rw: RwLock
+    lockStripes: seq[RwLock]
 
 ## Create or open a Glen database at the given directory.
 ## Loads snapshots, replays the WAL, and initializes cache and subscriptions.
-proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; walSync: WalSyncMode = wsmInterval; walFlushEveryBytes = 8*1024*1024): GlenDB =
+proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; walSync: WalSyncMode = wsmInterval; walFlushEveryBytes = 8*1024*1024; lockStripesCount = 32): GlenDB =
   result = GlenDB(
     dir: dir,
     wal: openWriteAheadLog(dir, syncMode = walSync, flushEveryBytes = walFlushEveryBytes),
@@ -35,6 +37,9 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
   )
   initLock(result.lock)
   initRwLock(result.rw)
+  result.lockStripes.setLen(lockStripesCount)
+  for i in 0 ..< lockStripesCount:
+    initRwLock(result.lockStripes[i])
   # load snapshots
   for kind, path in walkDir(dir):
     if kind == pcFile and path.endsWith(".snap"):
@@ -66,6 +71,60 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
         coll.del(rec.docId)
       if rec.docId in result.versions[rec.collection]: result.versions[rec.collection].del(rec.docId)
 
+# ---- Stripe locking helpers ----
+proc stripeIndex(db: GlenDB; collection: string): int =
+  if db.lockStripes.len == 0: return 0
+  abs(hash(collection).int) mod db.lockStripes.len
+
+proc acquireStripeRead(db: GlenDB; collection: string) =
+  acquireRead(db.lockStripes[db.stripeIndex(collection)])
+
+proc releaseStripeRead(db: GlenDB; collection: string) =
+  releaseRead(db.lockStripes[db.stripeIndex(collection)])
+
+proc acquireStripeWrite(db: GlenDB; collection: string) =
+  acquireWrite(db.lockStripes[db.stripeIndex(collection)])
+
+proc releaseStripeWrite(db: GlenDB; collection: string) =
+  releaseWrite(db.lockStripes[db.stripeIndex(collection)])
+
+proc acquireAllStripesWrite(db: GlenDB) =
+  for i in 0 ..< db.lockStripes.len:
+    acquireWrite(db.lockStripes[i])
+
+proc releaseAllStripesWrite(db: GlenDB) =
+  var i = db.lockStripes.len - 1
+  while i >= 0:
+    releaseWrite(db.lockStripes[i])
+    if i == 0: break
+    dec i
+
+proc acquireStripesWrite(db: GlenDB; stripes: seq[int]) =
+  var uniq = stripes
+  uniq.sort(system.cmp[int])
+  var idx = 0
+  while idx < uniq.len:
+    let i = uniq[idx]
+    acquireWrite(db.lockStripes[i])
+    inc idx
+    while idx < uniq.len and uniq[idx] == i:
+      inc idx
+
+proc releaseStripesWrite(db: GlenDB; stripes: seq[int]) =
+  var uniq = stripes
+  uniq.sort(system.cmp[int])
+  if uniq.len == 0: return
+  var idx = uniq.len - 1
+  while true:
+    let i = uniq[idx]
+    # skip duplicates while moving backward
+    var j = idx
+    while j > 0 and uniq[j-1] == i:
+      dec j
+    releaseWrite(db.lockStripes[i])
+    if j == 0: break
+    idx = j - 1
+
 ## Get the current value of a document by collection and id.
 ## Returns nil if not found. Cached reads are served from the LRU cache.
 proc get*(db: GlenDB; collection, docId: string): Value =
@@ -73,14 +132,14 @@ proc get*(db: GlenDB; collection, docId: string): Value =
   let cached = db.cache.get(key)
   if cached != nil:
     return cached.clone()
-  acquireRead(db.rw)
+  db.acquireStripeRead(collection)
   if collection in db.collections and docId in db.collections[collection]:
     let v = db.collections[collection][docId]
     db.cache.put(key, v)
     let cloned = v.clone()
-    releaseRead(db.rw)
+    db.releaseStripeRead(collection)
     return cloned
-  releaseRead(db.rw)
+  db.releaseStripeRead(collection)
 
 # Borrowed (non-cloned) read. Caller must not mutate returned Value.
 proc getBorrowed*(db: GlenDB; collection, docId: string): Value =
@@ -88,13 +147,13 @@ proc getBorrowed*(db: GlenDB; collection, docId: string): Value =
   let cached = db.cache.get(key)
   if cached != nil:
     return cached
-  acquireRead(db.rw)
+  db.acquireStripeRead(collection)
   if collection in db.collections and docId in db.collections[collection]:
     let v = db.collections[collection][docId]
     db.cache.put(key, v)
-    releaseRead(db.rw)
+    db.releaseStripeRead(collection)
     return v
-  releaseRead(db.rw)
+  db.releaseStripeRead(collection)
 
 # Transaction-aware read: records version for OCC
 ## Transaction-aware get. Records the version read into the provided transaction
@@ -123,7 +182,7 @@ proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(s
       missing.add(id)
   if missing.len == 0: return
   # Fill misses under a single read lock
-  acquireRead(db.rw)
+  db.acquireStripeRead(collection)
   if collection in db.collections:
     let coll = db.collections[collection]
     for id in missing:
@@ -131,7 +190,7 @@ proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(s
         let v = coll[id]
         db.cache.put(collection & ":" & id, v)
         result.add((id, v.clone()))
-  releaseRead(db.rw)
+  db.releaseStripeRead(collection)
 
 ## Borrowed batch get: returns refs without cloning. Caller must not mutate.
 proc getBorrowedMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(string, Value)] =
@@ -145,7 +204,7 @@ proc getBorrowedMany*(db: GlenDB; collection: string; docIds: openArray[string])
     else:
       missing.add(id)
   if missing.len == 0: return
-  acquireRead(db.rw)
+  db.acquireStripeRead(collection)
   if collection in db.collections:
     let coll = db.collections[collection]
     for id in missing:
@@ -153,7 +212,7 @@ proc getBorrowedMany*(db: GlenDB; collection: string; docIds: openArray[string])
         let v = coll[id]
         db.cache.put(collection & ":" & id, v)
         result.add((id, v))
-  releaseRead(db.rw)
+  db.releaseStripeRead(collection)
 
 ## Transaction-aware batch get. Records read versions for OCC.
 proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]; t: Txn): seq[(string, Value)] =
@@ -168,22 +227,22 @@ proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]; t: Txn)
 ## Get all documents in a collection. Returns pairs of (docId, Value).
 proc getAll*(db: GlenDB; collection: string): seq[(string, Value)] =
   result = @[]
-  acquireRead(db.rw)
+  db.acquireStripeRead(collection)
   if collection in db.collections:
     for id, v in db.collections[collection]:
       db.cache.put(collection & ":" & id, v)
       result.add((id, v.clone()))
-  releaseRead(db.rw)
+  db.releaseStripeRead(collection)
 
 ## Borrowed getAll: returns refs without cloning. Caller must not mutate.
 proc getBorrowedAll*(db: GlenDB; collection: string): seq[(string, Value)] =
   result = @[]
-  acquireRead(db.rw)
+  db.acquireStripeRead(collection)
   if collection in db.collections:
     for id, v in db.collections[collection]:
       db.cache.put(collection & ":" & id, v)
       result.add((id, v))
-  releaseRead(db.rw)
+  db.releaseStripeRead(collection)
 
 ## Transaction-aware getAll. Records read versions for all returned docs.
 proc getAll*(db: GlenDB; collection: string; t: Txn): seq[(string, Value)] =
@@ -200,7 +259,7 @@ proc getAll*(db: GlenDB; collection: string; t: Txn): seq[(string, Value)] =
 proc put*(db: GlenDB; collection, docId: string; value: Value) =
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
-  acquireWrite(db.rw)
+  db.acquireStripeWrite(collection)
   if collection notin db.collections:
     db.collections[collection] = initTable[string, Value]()
   if collection notin db.versions:
@@ -220,7 +279,7 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
       idx.reindexDoc(docId, oldDoc, stored)
   notifications.add((Id(collection: collection, docId: docId, version: newVer), stored))
   fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
-  releaseWrite(db.rw)
+  db.releaseStripeWrite(collection)
   for it in notifications:
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
@@ -231,7 +290,7 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
 proc delete*(db: GlenDB; collection, docId: string) =
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
-  acquireWrite(db.rw)
+  db.acquireStripeWrite(collection)
   if collection in db.collections and docId in db.collections[collection]:
     var ver = 1'u64
     if collection in db.versions and docId in db.versions[collection]:
@@ -247,7 +306,7 @@ proc delete*(db: GlenDB; collection, docId: string) =
     db.cache.del(collection & ":" & docId)
     notifications.add((Id(collection: collection, docId: docId, version: ver), VNull()))
     fieldNotifications.add((Id(collection: collection, docId: docId, version: ver), oldDoc, nil))
-  releaseWrite(db.rw)
+  db.releaseStripeWrite(collection)
   for it in notifications:
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
@@ -270,9 +329,13 @@ proc currentVersion*(db: GlenDB; collection, docId: string): uint64 =
 proc commit*(db: GlenDB; t: Txn): CommitResult =
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
-  acquireWrite(db.rw)
+  # Acquire all needed collection stripes in sorted order
+  var stripes: seq[int] = @[]
+  for key, _ in t.writes:
+    stripes.add(db.stripeIndex(key[0]))
+  db.acquireStripesWrite(stripes)
   if t.state != tsActive:
-    releaseWrite(db.rw)
+    db.releaseStripesWrite(stripes)
     return CommitResult(status: csInvalid, message: "Transaction not active")
   # validate
   for k, ver in t.readVersions:
@@ -281,7 +344,7 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
     let cur = db.currentVersion(parts[0], parts[1])
     if cur != ver:
       t.state = tsRolledBack
-      releaseWrite(db.rw)
+      db.releaseStripesWrite(stripes)
       return CommitResult(status: csConflict, message: "Version mismatch for " & k)
   # apply writes
   var walRecs: seq[WalRecord] = @[]
@@ -323,7 +386,7 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
   t.state = tsCommitted
-  releaseWrite(db.rw)
+  db.releaseStripesWrite(stripes)
   for it in notifications:
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
@@ -362,18 +425,77 @@ proc unsubscribeFieldDelta*(db: GlenDB; h: FieldDeltaSubscriptionHandle) =
 proc subscribeFieldDeltaStream*(db: GlenDB; collection, docId: string; fieldPath: string; s: Stream): FieldDeltaSubscriptionHandle =
   result = db.subs.subscribeFieldDeltaStream(collection, docId, fieldPath, s)
 
+## Batch put: apply multiple upserts under one write lock, batch WAL appends, update indexes and cache.
+proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)]) =
+  var notifications: seq[(Id, Value)] = @[]
+  var fieldNotifications: seq[(Id, Value, Value)] = @[]
+  db.acquireStripeWrite(collection)
+  if collection notin db.collections:
+    db.collections[collection] = initTable[string, Value]()
+  if collection notin db.versions:
+    db.versions[collection] = initTable[string, uint64]()
+  var walRecs: seq[WalRecord] = @[]
+  for (docId, value) in items:
+    var oldVer = 0'u64
+    if docId in db.versions[collection]: oldVer = db.versions[collection][docId]
+    let newVer = oldVer + 1
+    var stored = value.clone()
+    walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored))
+    var oldDoc: Value = nil
+    if docId in db.collections[collection]: oldDoc = db.collections[collection][docId]
+    db.collections[collection][docId] = stored
+    db.versions[collection][docId] = newVer
+    db.cache.put(collection & ":" & docId, stored)
+    if collection in db.indexes:
+      for _, idx in db.indexes[collection]:
+        idx.reindexDoc(docId, oldDoc, stored)
+    notifications.add((Id(collection: collection, docId: docId, version: newVer), stored))
+    fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
+  if walRecs.len > 0: db.wal.appendMany(walRecs)
+  db.releaseStripeWrite(collection)
+  for it in notifications: db.subs.notify(it[0], it[1])
+  for it in fieldNotifications: db.subs.notifyFieldChanges(it[0], it[1], it[2])
+
+## Batch delete: delete multiple documents under one write lock, batch WAL appends.
+proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
+  var notifications: seq[(Id, Value)] = @[]
+  var fieldNotifications: seq[(Id, Value, Value)] = @[]
+  db.acquireStripeWrite(collection)
+  if collection notin db.collections:
+    db.releaseStripeWrite(collection); return
+  var walRecs: seq[WalRecord] = @[]
+  for docId in docIds:
+    if docId in db.collections[collection]:
+      var ver = 1'u64
+      if collection in db.versions and docId in db.versions[collection]:
+        ver = db.versions[collection][docId] + 1
+      walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver))
+      var oldDoc = db.collections[collection][docId]
+      if collection in db.indexes:
+        for _, idx in db.indexes[collection]:
+          idx.unindexDoc(docId, oldDoc)
+      db.collections[collection].del(docId)
+      if collection in db.versions and docId in db.versions[collection]: db.versions[collection].del(docId)
+      db.cache.del(collection & ":" & docId)
+      notifications.add((Id(collection: collection, docId: docId, version: ver), VNull()))
+      fieldNotifications.add((Id(collection: collection, docId: docId, version: ver), oldDoc, nil))
+  if walRecs.len > 0: db.wal.appendMany(walRecs)
+  db.releaseStripeWrite(collection)
+  for it in notifications: db.subs.notify(it[0], it[1])
+  for it in fieldNotifications: db.subs.notifyFieldChanges(it[0], it[1], it[2])
+
 # Snapshot trigger (simple: write all collections)
 ## Write snapshots for all collections to durable storage.
 proc snapshotAll*(db: GlenDB) =
-  acquireWrite(db.rw)
-  defer: releaseWrite(db.rw)
+  db.acquireAllStripesWrite()
+  defer: db.releaseAllStripesWrite()
   for collection, docs in db.collections:
     writeSnapshot(db.dir, collection, docs)
 
 ## Create an equality index on a field path (e.g., "name" or "profile.age").
 proc createIndex*(db: GlenDB; collection: string; name: string; fieldPath: string) =
-  acquireWrite(db.rw)
-  defer: releaseWrite(db.rw)
+  db.acquireStripeWrite(collection)
+  defer: db.releaseStripeWrite(collection)
   if collection notin db.indexes:
     db.indexes[collection] = initTable[string, Index]()
   let idx = newIndex(name, fieldPath)
@@ -385,15 +507,15 @@ proc createIndex*(db: GlenDB; collection: string; name: string; fieldPath: strin
 
 ## Drop an existing index by name.
 proc dropIndex*(db: GlenDB; collection: string; name: string) =
-  acquireWrite(db.rw)
-  defer: releaseWrite(db.rw)
+  db.acquireStripeWrite(collection)
+  defer: db.releaseStripeWrite(collection)
   if collection in db.indexes and name in db.indexes[collection]:
     db.indexes[collection].del(name)
 
 ## Query documents by equality on an indexed field. Optional limit.
 proc findBy*(db: GlenDB; collection: string; indexName: string; keyValue: Value; limit = 0): seq[(string, Value)] =
-  acquireRead(db.rw)
-  defer: releaseRead(db.rw)
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
   if collection notin db.indexes or indexName notin db.indexes[collection]: return @[]
   let idx = db.indexes[collection][indexName]
   result = @[]
@@ -403,8 +525,8 @@ proc findBy*(db: GlenDB; collection: string; indexName: string; keyValue: Value;
 
 ## Range query on a single-field index, with order and limit.
 proc rangeBy*(db: GlenDB; collection: string; indexName: string; minVal, maxVal: Value; inclusiveMin = true; inclusiveMax = true; limit = 0; asc = true): seq[(string, Value)] =
-  acquireRead(db.rw)
-  defer: releaseRead(db.rw)
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
   if collection notin db.indexes or indexName notin db.indexes[collection]: return @[]
   let idx = db.indexes[collection][indexName]
   result = @[]
@@ -416,8 +538,8 @@ proc rangeBy*(db: GlenDB; collection: string; indexName: string; minVal, maxVal:
 ## Snapshot all collections and truncate the WAL so that recovery can start
 ## from the snapshots and a fresh log.
 proc compact*(db: GlenDB) =
-  acquireWrite(db.rw)
-  defer: releaseWrite(db.rw)
+  db.acquireAllStripesWrite()
+  defer: db.releaseAllStripesWrite()
   for collection, docs in db.collections:
     writeSnapshot(db.dir, collection, docs)
   # Reset WAL after snapshot to start a new, empty log
@@ -427,8 +549,8 @@ proc compact*(db: GlenDB) =
 # Close database resources
 ## Close database resources (WAL file handles).
 proc close*(db: GlenDB) =
-  acquireWrite(db.rw)
-  defer: releaseWrite(db.rw)
+  db.acquireAllStripesWrite()
+  defer: db.releaseAllStripesWrite()
   if db.wal != nil:
     db.wal.close()
 
@@ -436,8 +558,21 @@ proc cacheStats*(db: GlenDB): CacheStats =
   db.cache.stats()
 
 proc setWalSync*(db: GlenDB; mode: WalSyncMode; flushEveryBytes = 0) =
-  acquireWrite(db.rw)
-  defer: releaseWrite(db.rw)
+  db.acquireAllStripesWrite()
+  defer: db.releaseAllStripesWrite()
   if db.wal != nil:
     db.wal.setSyncPolicy(mode, flushEveryBytes)
+
+proc newGlenDBFromEnv*(dir: string): GlenDB =
+  let cfg = loadConfig()
+  var mode = wsmInterval
+  if cfg.walSyncMode == "always": mode = wsmAlways
+  elif cfg.walSyncMode == "none": mode = wsmNone
+  result = newGlenDB(
+    dir,
+    cacheCapacity = cfg.cacheCapacityBytes,
+    cacheShards = cfg.cacheShards,
+    walSync = mode,
+    walFlushEveryBytes = cfg.walFlushEveryBytes
+  )
 

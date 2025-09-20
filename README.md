@@ -6,6 +6,7 @@ Glen is a wickedly fast embedded document database written in Nim. It offers:
 - Durable write-ahead log with per-record checksums and segment headers
 - Atomic snapshots (temp file + rename) and manual compaction with WAL truncation
 - Dynamic adaptive LRU caching layer
+- Sharded LRU cache with per-shard locks and tunable capacity/shards
 - Optimistic multi-document transactions (CommitResult status on commit)
 - Fine-grained subscriptions to specific documents (collection + id)
 - Compact binary codec with bounds checks
@@ -58,6 +59,10 @@ echo db.get("users", "u1")           # {age: 30, name: "Alice"}
 
 db.delete("users", "u1")
 echo db.get("users", "u1") == nil     # true
+
+# Batch writes to reduce lock overhead
+db.putMany("users", @[("u2", VString("a")), ("u3", VString("b"))])
+db.deleteMany("users", @["u2", "u3"]) 
 ```
 
 ### Transactions (optimistic)
@@ -73,6 +78,20 @@ discard db.get("items", "i1", t)       # record read version
 t.stagePut(Id(collection: "items", docId: "i1", version: 0'u64), VString("new"))
 let res = db.commit(t)                    # CommitResult
 echo res.status                           # csOk or csConflict
+
+```
+### Borrowed reads (no clone)
+
+Borrowed variants return shared references for performance. Do not mutate the returned `Value`.
+
+```nim
+let vRef = db.getBorrowed("users", "u1")
+for (id, v) in db.getBorrowedMany("users", @["u1", "u2"]): discard
+for (id, v) in db.getBorrowedAll("users"): discard
+```
+
+These are ideal for read-only hot paths where you control immutability.
+
 ```
 
 ### Subscriptions
@@ -164,10 +183,10 @@ echo o["n"].toIntOpt().get()        # 7
 
 ### WAL sync policy (durability vs throughput)
 
-By default Glen flushes (`fsync`) on every append for maximum durability. You can tune this:
+By default Glen uses interval flushing for better throughput. You can tune this:
 
-- `wsmAlways` (default): flush every WAL append.
-- `wsmInterval`: batch fsyncs based on a byte threshold.
+- `wsmAlways`: flush every WAL append (most durable, slowest).
+- `wsmInterval` (default): batch fsyncs based on a byte threshold.
 - `wsmNone`: rely on OS page cache (fastest, least durable).
 
 Usage:
@@ -176,7 +195,24 @@ Usage:
 import glen/db, glen/wal
 
 let db = newGlenDB("./mydb", walSync = wsmInterval)      # interval policy
-db.wal.setSyncPolicy(wsmInterval, flushEveryBytes = 1_048_576)  # 1 MiB batches
+db.setWalSync(wsmInterval, flushEveryBytes = 8 * 1024 * 1024)   # 8 MiB batches
+
+# Or via environment variables and helper:
+# set GLEN_WAL_SYNC=interval
+# set GLEN_WAL_FLUSH_BYTES=8388608
+# set GLEN_CACHE_CAP_BYTES=67108864
+# set GLEN_CACHE_SHARDS=16
+let db2 = newGlenDBFromEnv("./mydb2")
+
+### Concurrency (striped locks)
+
+Glen uses striped read/write locks per collection to reduce contention under mixed workloads. You can tune the stripe count:
+
+```nim
+let db = newGlenDB("./mydb", cacheCapacity = 128*1024*1024, cacheShards = 32, lockStripesCount = 32)
+```
+
+Transactions spanning multiple collections lock the needed stripes in a fixed order to avoid deadlocks.
 ```
 
 Note: On Windows, directory metadata is flushed when new WAL segments or snapshots are created. On POSIX, standard file flush is used.
@@ -283,10 +319,15 @@ Delta stream: `subscribeFieldDeltaStream` writes framed events with `{collection
 
 ## Testing
 
-Run the suite:
+Run the suite (debug):
 
 ```
 nimble test
 ```
+Release/optimized run (ORC + O3):
 
+```
+nimble test_release
+nimble bench_release
+```
 Topic-specific tests are under `tests/`.

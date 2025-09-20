@@ -35,7 +35,10 @@ Non-goals (for now):
 - `collections`: `Table[string, Table[string, Value]]`
 - `versions`: `Table[string, Table[string, uint64]]`
 - `indexes`: `Table[string, IndexesByName]`
-- Synchronization: Reader-prefer `RwLock` protecting DB state (future: per-collection locks).
+- Synchronization: Reader-prefer `RwLock` with per-collection striped locks.
+  - Stripe selection: `hash(collection) % N` where N is `lockStripesCount` (configurable)
+  - Multi-collection ops (e.g., commit) lock stripes in ascending order to avoid deadlocks
+  - Global ops (snapshot/compact/close) lock all stripes
 
 ### 3.2 Sharded LRU Cache
 - Purpose: Reduce read latency and lock contention.
@@ -52,6 +55,7 @@ Non-goals (for now):
   - `wsmInterval`: fsync after `flushEveryBytes` written (default); balances throughput and durability window.
   - `wsmNone`: rely on OS buffering.
 - Batching: Commits build multiple `WalRecord`s and append them via `appendMany` to minimize flushes.
+- Concurrency: WAL appends are guarded by an internal mutex so concurrent striped writers are safe.
 - Rotation: New segment when max size exceeded; durable magic/version header on first write.
 - Recovery: On open, replay all segments after loading snapshots; tail corruption tolerated.
 
@@ -67,8 +71,8 @@ Non-goals (for now):
 - Staging: `t.stagePut(id, value)` / `t.stageDelete(collection, docId)`.
 - Commit:
   1) Validate all observed versions against current versions; conflict → rollback.
-  2) Compute new versions; build WAL records; update in-memory state and cache; reindex.
-  3) Batch-append WAL; notify subscribers after releasing the write lock.
+  2) Acquire write locks for involved collection stripes (sorted order); compute new versions; build WAL records; update in-memory state and cache; reindex.
+  3) Batch-append WAL; release locks; notify subscribers afterwards.
 
 ### 3.6 Subscriptions
 - Document-level: Subscribers receive new Value for a `(collection, docId)` on change.
@@ -86,8 +90,9 @@ Non-goals (for now):
 ---
 
 ## 4. Concurrency Model
-- Core state protected by a reader-prefer `RwLock`: readers proceed unless a writer holds the lock.
+- Core state protected by a reader-prefer `RwLock`.
 - Cache is sharded; each shard has its own lock; drastically reduces contention for hot reads.
+- Per-collection striped locks isolate contention between different collections; multi-collection ops lock multiple stripes with deadlock-safe ordering.
 - Transactions are optimistic: conflicts are detected at commit by comparing versions.
 
 ### Borrowed Reads
@@ -126,7 +131,7 @@ Non-goals (for now):
 
 ### 6.4 Locking Strategy
 - Reader-prefer RW lock benefits read-heavy workloads.
-- Future: per-collection locks or striped locks to reduce global contention under mixed workloads.
+- Use striped locks (default 32) to reduce global contention under mixed workloads; tune `lockStripesCount` to core count.
 
 ### 6.5 Monitoring
 - Expose and monitor `db.cacheStats()` to track hit rates and shard imbalances.
@@ -140,7 +145,7 @@ Non-goals (for now):
 - Database directory contains `*.snap` (one per collection) and WAL segments `glen.wal.N`.
 
 ### 7.2 Configuration
-- Constructor: `newGlenDB(dir; cacheCapacity, cacheShards, walSync, walFlushEveryBytes)`.
+- Constructor: `newGlenDB(dir; cacheCapacity, cacheShards, walSync, walFlushEveryBytes, lockStripesCount)`.
 - Runtime WAL policy: `db.setWalSync(mode, flushEveryBytes)`.
 - Cache capacity can be adjusted at runtime: `cache.adjustCapacity(newCap)`.
 
@@ -180,8 +185,9 @@ Non-goals (for now):
 ---
 
 ## 11. API Highlights
-- Creation: `newGlenDB(dir; cacheCapacity, cacheShards, walSync, walFlushEveryBytes)`
+- Creation: `newGlenDB(dir; cacheCapacity, cacheShards, walSync, walFlushEveryBytes, lockStripesCount)`
 - Basic Ops: `put`, `get`, `getMany`, `getAll`, `delete`
+- Batch Ops: `putMany`, `deleteMany`
 - Borrowed Reads: `getBorrowed`, `getBorrowedMany`, `getBorrowedAll` (do not mutate)
 - Transactions: `beginTxn`, `get(..., t)`, `getMany(..., t)`, `commit`, `rollback`
 - Indexes: `createIndex`, `dropIndex`, `findBy`, `rangeBy`

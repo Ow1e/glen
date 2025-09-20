@@ -23,5 +23,5 @@ jobs:
           nimble -y refresh
       - name: Run tests
         run: |
-          nimble test -y
+          nimble test_release -y
 

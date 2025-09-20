@@ -4,7 +4,7 @@
 # Body layout: varuint recordType | collection | docId | version | valueLen(+value)
 # recordType: 1 = Put {collection, id, version, value}; 2 = Delete {collection,id,version}
 
-import std/[os, streams]
+import std/[os, streams, locks]
 when defined(windows):
   import std/winlean
 import glen/types, glen/codec
@@ -35,6 +35,7 @@ type
     syncMode: WalSyncMode
     flushEveryBytes: int
     bytesSinceFlush: int
+    lock: Lock
 
 proc fnv1a32(data: string): uint32 =
   var h: uint32 = 0x811C9DC5'u32
@@ -95,6 +96,7 @@ proc openSegment(wal: WriteAheadLog) =
 proc openWriteAheadLog*(dir: string; maxSegmentSize = 8 * 1024 * 1024; syncMode: WalSyncMode = wsmAlways; flushEveryBytes = 1 * 1024 * 1024): WriteAheadLog =
   createDir(dir)
   result = WriteAheadLog(dir: dir, maxSegmentSize: maxSegmentSize, syncMode: syncMode, flushEveryBytes: flushEveryBytes, bytesSinceFlush: 0)
+  initLock(result.lock)
   # find last segment
   var idx = 0
   while fileExists(segmentPath(dir, idx + 1)): inc idx
@@ -141,6 +143,8 @@ proc totalSize*(wal: WriteAheadLog): int =
   sum
 
 proc append*(wal: WriteAheadLog; rec: WalRecord) =
+  acquire(wal.lock)
+  defer: release(wal.lock)
   var ms = newStringStream()
   # recordType
   writeVarUint(ms, uint64(rec.kind.ord))
@@ -189,6 +193,8 @@ proc append*(wal: WriteAheadLog; rec: WalRecord) =
     discard
 
 proc appendMany*(wal: WriteAheadLog; recs: openArray[WalRecord]) =
+  acquire(wal.lock)
+  defer: release(wal.lock)
   var totalWritten = 0
   for rec in recs:
     var ms = newStringStream()

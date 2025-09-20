@@ -33,5 +33,12 @@ task test, "Run test suite":
   for f in testFiles:
     runTest(f)
 
+task test_release, "Run test suite (release, ORC, O3)":
+  for f in testFiles:
+    exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src " & f
+
+task bench_release, "Run only benchmark (release, ORC, O3)":
+  exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench.nim"
+
 task docs, "Generate API docs":
   exec "nim doc --project --outdir:docs --path:src src/glen/glen.nim"

@@ -53,3 +53,30 @@ suite "soak (short)":
       discard db.get("items", randKey(numKeys))
     db.close()
 
+  test "striped locks reduce contention across collections (smoke)":
+    randomize()
+    let dir = getTempDir() / "glen_test_stripes"
+    if dirExists(dir): removeDir(dir)
+    let db = newGlenDB(dir, lockStripesCount = 32)
+    # Populate multiple collections in quick succession; ensure no deadlocks and correctness
+    for i in 0 ..< 200:
+      let coll = if (i mod 2) == 0: "cA" else: "cB"
+      db.put(coll, "k" & $i, VInt(i.int64))
+    # Interleave batch ops across collections
+    db.putMany("cA", @[("ka1", VInt(1)), ("ka2", VInt(2)), ("ka3", VInt(3))])
+    db.putMany("cB", @[("kb1", VInt(1)), ("kb2", VInt(2))])
+    # Validate reads from both collections
+    check db.get("cA", "ka1") == VInt(1)
+    check db.get("cB", "kb2") == VInt(2)
+    # Multi-collection transaction: should not deadlock
+    let t = db.beginTxn()
+    t.stagePut(Id(collection: "cA", docId: "ta", version: 0'u64), VInt(10))
+    t.stagePut(Id(collection: "cB", docId: "tb", version: 0'u64), VInt(20))
+    let res = db.commit(t)
+    check res.status == csOk
+    check db.get("cA", "ta") == VInt(10)
+    check db.get("cB", "tb") == VInt(20)
+    # Snapshot/compact under stripes
+    db.snapshotAll()
+    db.compact()
+    db.close()
