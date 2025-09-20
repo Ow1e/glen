@@ -67,7 +67,7 @@ when isMainModule:
   let dir = getTempDir() / "glen_bench_db"
   if dirExists(dir): removeDir(dir)
   let database = newGlenDB(dir, cacheCapacity = 128*1024*1024, cacheShards = 32, walSync = wsmInterval, walFlushEveryBytes = 8*1024*1024, lockStripesCount = 64)
-  let N = 5000
+  let N = 20000
   var keys: seq[string] = newSeq[string](N)
   for i in 0 ..< N: keys[i] = "k" & $i
 
