@@ -68,6 +68,13 @@ proc serializeKey*(v: Value): string =
   else:
     return serializePart(v)
 
+proc commonPrefix(a, b: string): string =
+  let n = if a.len < b.len: a.len else: b.len
+  var i = 0
+  while i < n and a[i] == b[i]: inc i
+  if i == 0: return ""
+  return a[0 ..< i]
+
 proc newIndex*(name: string; fieldExpr: string): Index =
   ## fieldExpr: comma-separated paths, e.g., "name" or "name,profile.age"
   var paths: seq[seq[string]] = @[]
@@ -138,18 +145,42 @@ proc findRange*(i: Index; minVal: Value; maxVal: Value; inclusiveMin = true; inc
   let maxK = if maxVal.isNil: "\xFF".repeat(8) else: serializeKey(maxVal)
   result = @[]
   if asc:
-    for k, _ in i.keysTree.pairs:
-      if k < minK or (k == minK and not inclusiveMin):
-        continue
-      if k > maxK or (k == maxK and not inclusiveMax):
-        break
-      for id in i.map[k].items:
-        result.add(id)
-        if limit > 0 and result.len >= limit: return
+    let prefix = commonPrefix(minK, maxK)
+    if prefix.len > 0:
+      for k in i.keysTree.keysWithPrefix(prefix):
+        if k < minK or (k == minK and not inclusiveMin):
+          continue
+        if k > maxK or (k == maxK and not inclusiveMax):
+          break
+        for id in i.map[k].items:
+          result.add(id)
+          if limit > 0 and result.len >= limit: return
+    else:
+      for k in i.keysTree.keys:
+        if k < minK or (k == minK and not inclusiveMin):
+          continue
+        if k > maxK or (k == maxK and not inclusiveMax):
+          break
+        for id in i.map[k].items:
+          result.add(id)
+          if limit > 0 and result.len >= limit: return
   else:
     var tmpKeys: seq[string] = @[]
-    for k, _ in i.keysTree.pairs:
-      tmpKeys.add(k)
+    let prefix = commonPrefix(minK, maxK)
+    if prefix.len > 0:
+      for k in i.keysTree.keysWithPrefix(prefix):
+        if k > maxK or (k == maxK and not inclusiveMax):
+          break
+        if k < minK or (k == minK and not inclusiveMin):
+          continue
+        tmpKeys.add(k)
+    else:
+      for k in i.keysTree.keys:
+        if k > maxK or (k == maxK and not inclusiveMax):
+          break
+        if k < minK or (k == minK and not inclusiveMin):
+          continue
+        tmpKeys.add(k)
     var idx = tmpKeys.len - 1
     while idx >= 0:
       let k = tmpKeys[idx]

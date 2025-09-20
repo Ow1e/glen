@@ -127,32 +127,36 @@ proc releaseStripesWrite(db: GlenDB; stripes: seq[int]) =
 
 ## Get the current value of a document by collection and id.
 ## Returns nil if not found. Cached reads are served from the LRU cache.
-proc get*(db: GlenDB; collection, docId: string): Value =
+proc get*(db: GlenDB; collection, docId: string): Value {.inline.} =
   let key = collection & ":" & docId
   let cached = db.cache.get(key)
   if cached != nil:
     return cached.clone()
   db.acquireStripeRead(collection)
-  if collection in db.collections and docId in db.collections[collection]:
-    let v = db.collections[collection][docId]
-    db.cache.put(key, v)
-    let cloned = v.clone()
-    db.releaseStripeRead(collection)
-    return cloned
+  if collection in db.collections:
+    let coll = db.collections[collection]
+    if docId in coll:
+      let v = coll[docId]
+      db.cache.put(key, v)
+      let cloned = v.clone()
+      db.releaseStripeRead(collection)
+      return cloned
   db.releaseStripeRead(collection)
 
 # Borrowed (non-cloned) read. Caller must not mutate returned Value.
-proc getBorrowed*(db: GlenDB; collection, docId: string): Value =
+proc getBorrowed*(db: GlenDB; collection, docId: string): Value {.inline.} =
   let key = collection & ":" & docId
   let cached = db.cache.get(key)
   if cached != nil:
     return cached
   db.acquireStripeRead(collection)
-  if collection in db.collections and docId in db.collections[collection]:
-    let v = db.collections[collection][docId]
-    db.cache.put(key, v)
-    db.releaseStripeRead(collection)
-    return v
+  if collection in db.collections:
+    let coll = db.collections[collection]
+    if docId in coll:
+      let v = coll[docId]
+      db.cache.put(key, v)
+      db.releaseStripeRead(collection)
+      return v
   db.releaseStripeRead(collection)
 
 # Transaction-aware read: records version for OCC
