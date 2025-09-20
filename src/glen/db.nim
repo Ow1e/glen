@@ -5,6 +5,20 @@ import glen/types, glen/wal, glen/storage, glen/cache, glen/subscription, glen/t
 import glen/rwlock
 import glen/index
 import glen/config
+import glen/util
+type
+  ReplOp* = enum roPut, roDelete
+
+  ReplChange* = object
+    collection*: string
+    docId*: string
+    op*: ReplOp
+    version*: uint64
+    value*: Value
+    changeId*: string
+    originNode*: string
+    hlc*: Hlc
+
 
 # In-memory store: collection -> (docId -> Value)
 
@@ -22,6 +36,15 @@ type
     lock: Lock
     rw: RwLock
     lockStripes: seq[RwLock]
+    # Replication
+    nodeId*: string
+    replSeq: uint64
+    # change log (in-memory): seq -> change
+    replLog: seq[(uint64, ReplChange)]
+    # last applied HLC per doc for conflict resolution
+    replMetaHlc: Table[string, Table[string, Hlc]]
+    # last applied changeId per doc for idempotency
+    replMetaChangeId: Table[string, Table[string, string]]
 
 ## Create or open a Glen database at the given directory.
 ## Loads snapshots, replays the WAL, and initializes cache and subscriptions.
@@ -33,13 +56,23 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
     versions: initTable[string, Table[string, uint64]](),
     cache: newLruCache(cacheCapacity, numShards = cacheShards),
     subs: newSubscriptionManager(),
-    indexes: initTable[string, IndexesByName]()
+    indexes: initTable[string, IndexesByName](),
+    replSeq: 0,
+    replLog: @[],
+    replMetaHlc: initTable[string, Table[string, Hlc]](),
+    replMetaChangeId: initTable[string, Table[string, string]]()
   )
   initLock(result.lock)
   initRwLock(result.rw)
   result.lockStripes.setLen(lockStripesCount)
   for i in 0 ..< lockStripesCount:
     initRwLock(result.lockStripes[i])
+  # derive nodeId if provided
+  let cfg = loadConfig()
+  if cfg.nodeId.len > 0:
+    result.nodeId = cfg.nodeId
+  else:
+    result.nodeId = $nowMillis() & ":" & $cast[uint64](result)
   # load snapshots
   for kind, path in walkDir(dir):
     if kind == pcFile and path.endsWith(".snap"):
@@ -269,6 +302,10 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
   let newVer = oldVer + 1
   var stored = value.clone()
   db.wal.append(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored))
+  # record replication change (local origin)
+  inc db.replSeq
+  let ch = ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: stored, changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))
+  db.replLog.add((db.replSeq, ch))
   var oldDoc: Value = nil
   if docId in db.collections[collection]: oldDoc = db.collections[collection][docId]
   db.collections[collection][docId] = stored
@@ -296,6 +333,9 @@ proc delete*(db: GlenDB; collection, docId: string) =
     if collection in db.versions and docId in db.versions[collection]:
       ver = db.versions[collection][docId] + 1
     db.wal.append(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver))
+    inc db.replSeq
+    let ch = ReplChange(collection: collection, docId: docId, op: roDelete, version: ver, value: nil, changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))
+    db.replLog.add((db.replSeq, ch))
     var oldDoc = db.collections[collection][docId]
     if collection in db.indexes:
       for _, idx in db.indexes[collection]:
@@ -385,6 +425,15 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
+  # record replication changes
+  for key, w in t.writes:
+    let collection = key[0]
+    let docId = key[1]
+    inc db.replSeq
+    if w.kind == twDelete:
+      db.replLog.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roDelete, version: db.currentVersion(collection, docId), value: nil, changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))))
+    else:
+      db.replLog.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roPut, version: db.currentVersion(collection, docId), value: db.collections[collection][docId], changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))))
   t.state = tsCommitted
   db.releaseStripesWrite(stripes)
   for it in notifications:
@@ -452,6 +501,10 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
     notifications.add((Id(collection: collection, docId: docId, version: newVer), stored))
     fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
   if walRecs.len > 0: db.wal.appendMany(walRecs)
+  # replication log for batch
+  for (docId, _) in items:
+    inc db.replSeq
+    db.replLog.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roPut, version: db.currentVersion(collection, docId), value: db.collections[collection][docId], changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))))
   db.releaseStripeWrite(collection)
   for it in notifications: db.subs.notify(it[0], it[1])
   for it in fieldNotifications: db.subs.notifyFieldChanges(it[0], it[1], it[2])
@@ -480,6 +533,9 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
       notifications.add((Id(collection: collection, docId: docId, version: ver), VNull()))
       fieldNotifications.add((Id(collection: collection, docId: docId, version: ver), oldDoc, nil))
   if walRecs.len > 0: db.wal.appendMany(walRecs)
+  for docId in docIds:
+    inc db.replSeq
+    db.replLog.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roDelete, version: db.currentVersion(collection, docId), value: nil, changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))))
   db.releaseStripeWrite(collection)
   for it in notifications: db.subs.notify(it[0], it[1])
   for it in fieldNotifications: db.subs.notifyFieldChanges(it[0], it[1], it[2])
@@ -575,4 +631,81 @@ proc newGlenDBFromEnv*(dir: string): GlenDB =
     walSync = mode,
     walFlushEveryBytes = cfg.walFlushEveryBytes
   )
+
+# -------- Replication (multi-master) API --------
+
+type ReplExportCursor* = uint64
+
+proc exportChanges*(db: GlenDB; since: ReplExportCursor; includeCollections: seq[string] = @[]; excludeCollections: seq[string] = @[]): (ReplExportCursor, seq[ReplChange]) =
+  ## Export changes after the provided cursor, filtered by collection allow/deny lists.
+  ## Returns the new cursor and a sequence of changes.
+  var allow = initTable[string, bool]()
+  if includeCollections.len > 0:
+    for c in includeCollections: allow[c] = true
+  var deny = initTable[string, bool]()
+  for c in excludeCollections: deny[c] = true
+  var changesOut: seq[ReplChange] = @[]
+  var nextCursor = since
+  for (seqNo, ch) in db.replLog:
+    if seqNo <= since: continue
+    if includeCollections.len > 0 and ch.collection notin allow: continue
+    if ch.collection in deny: continue
+    changesOut.add(ch)
+    if seqNo > nextCursor: nextCursor = seqNo
+  return (nextCursor, changesOut)
+
+proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
+  ## Apply a batch of changes from a remote node. Idempotent via changeId; resolves conflicts using HLC (LWW semantics).
+  var notifications: seq[(Id, Value)] = @[]
+  var fieldNotifications: seq[(Id, Value, Value)] = @[]
+  for ch in changes:
+    let coll = ch.collection
+    let id = ch.docId
+    let stripe = db.stripeIndex(coll)
+    acquireWrite(db.lockStripes[stripe])
+    # init per-collection maps
+    if coll notin db.collections: db.collections[coll] = initTable[string, Value]()
+    if coll notin db.versions: db.versions[coll] = initTable[string, uint64]()
+    if coll notin db.replMetaHlc: db.replMetaHlc[coll] = initTable[string, Hlc]()
+    if coll notin db.replMetaChangeId: db.replMetaChangeId[coll] = initTable[string, string]()
+    # idempotency
+    if id in db.replMetaChangeId[coll] and db.replMetaChangeId[coll][id] == ch.changeId:
+      releaseWrite(db.lockStripes[stripe]); continue
+    # conflict resolution (LWW by HLC)
+    var accept = true
+    if id in db.replMetaHlc[coll]:
+      let cur = db.replMetaHlc[coll][id]
+      if hlcCompare(ch.hlc, cur) < 0:
+        accept = false
+    if accept:
+      if ch.op == roDelete:
+        var oldDoc: Value = nil
+        if id in db.collections[coll]:
+          oldDoc = db.collections[coll][id]
+          if coll in db.indexes:
+            for _, idx in db.indexes[coll]: idx.unindexDoc(id, oldDoc)
+          db.collections[coll].del(id)
+        if id in db.versions[coll]: db.versions[coll].del(id)
+        db.cache.del(coll & ":" & id)
+        notifications.add((Id(collection: coll, docId: id, version: ch.version), VNull()))
+        fieldNotifications.add((Id(collection: coll, docId: id, version: ch.version), oldDoc, nil))
+      else:
+        var stored = if ch.value.isNil: VNull() else: ch.value
+        var oldDoc: Value = nil
+        if id in db.collections[coll]: oldDoc = db.collections[coll][id]
+        db.collections[coll][id] = stored
+        db.versions[coll][id] = ch.version
+        db.cache.put(coll & ":" & id, stored)
+        if coll in db.indexes:
+          for _, idx in db.indexes[coll]: idx.reindexDoc(id, oldDoc, stored)
+        notifications.add((Id(collection: coll, docId: id, version: ch.version), stored))
+        fieldNotifications.add((Id(collection: coll, docId: id, version: ch.version), oldDoc, stored))
+      db.replMetaHlc[coll][id] = ch.hlc
+      db.replMetaChangeId[coll][id] = ch.changeId
+    releaseWrite(db.lockStripes[stripe])
+  # Fire notifications outside locks
+  for it in notifications:
+    db.subs.notify(it[0], it[1])
+  for it in fieldNotifications:
+    db.subs.notifyFieldChanges(it[0], it[1], it[2])
 

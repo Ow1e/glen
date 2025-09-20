@@ -25,6 +25,21 @@ type
     of vkObject: obj*: Table[string, Value]
     of vkId: id*: Id
 
+# Hybrid Logical Clock for multi-master ordering
+type
+  Hlc* = object
+    wallMillis*: int64
+    counter*: uint32
+    nodeId*: string
+
+proc hlcCompare*(a, b: Hlc): int {.noSideEffect.} =
+  if a.wallMillis < b.wallMillis: return -1
+  if a.wallMillis > b.wallMillis: return 1
+  if a.counter < b.counter: return -1
+  if a.counter > b.counter: return 1
+  if a.nodeId < b.nodeId: return -1
+  if a.nodeId > b.nodeId: return 1
+  0
 # Constructors
 proc VNull*(): Value = Value(kind: vkNull)
 proc VBool*(b: bool): Value = Value(kind: vkBool, b: b)
