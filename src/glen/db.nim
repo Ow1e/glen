@@ -1,6 +1,6 @@
 # Glen DB high-level API
 
-import std/[os, tables, locks, strutils, streams, hashes, algorithm, parseutils]
+import std/[os, tables, locks, strutils, streams, hashes, algorithm, parseutils, random]
 import glen/types, glen/wal, glen/storage, glen/cache, glen/subscription, glen/txn
 import glen/rwlock
 import glen/index
@@ -51,6 +51,27 @@ type
     peersCursors: Table[string, uint64]
     peersStatePath: string
 
+# Generate a stable, unique-ish node id and persist it to disk when needed.
+proc bytesToHex(bytes: openArray[byte]): string =
+  const hexdigits = "0123456789abcdef"
+  result = newString(bytes.len * 2)
+  var j = 0
+  for b in bytes:
+    let v = int(b)
+    result[j] = hexdigits[(v shr 4) and 0xF]
+    inc j
+    result[j] = hexdigits[v and 0xF]
+    inc j
+
+proc generateStableNodeId(): string =
+  ## Uses wall-clock millis and 16 random bytes hex-encoded.
+  ## Randomness is seeded from time to avoid duplicate IDs across processes.
+  randomize()
+  var bytes = newSeq[byte](16)
+  for i in 0 ..< bytes.len:
+    bytes[i] = byte(rand(255))
+  result = $nowMillis() & ":" & bytesToHex(bytes)
+
 ## Create or open a Glen database at the given directory.
 ## Loads snapshots, replays the WAL, and initializes cache and subscriptions.
 proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; walSync: WalSyncMode = wsmInterval; walFlushEveryBytes = 8*1024*1024; lockStripesCount = 32): GlenDB =
@@ -83,10 +104,14 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
   elif fileExists(nodeIdPath):
     try:
       result.nodeId = readFile(nodeIdPath).strip()
+      if result.nodeId.len == 0:
+        result.nodeId = generateStableNodeId()
+        writeFile(nodeIdPath, result.nodeId)
     except IOError:
-      result.nodeId = $nowMillis() & ":" & $cast[uint64](result)
+      result.nodeId = generateStableNodeId()
+      writeFile(nodeIdPath, result.nodeId)
   else:
-    result.nodeId = $nowMillis() & ":" & $cast[uint64](result)
+    result.nodeId = generateStableNodeId()
     writeFile(nodeIdPath, result.nodeId)
   # init local HLC
   result.localHlc = Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: result.nodeId)
