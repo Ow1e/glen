@@ -11,7 +11,7 @@ import glen/types, glen/codec
 
 const WAL_PREFIX = "glen.wal."
 const WAL_MAGIC = "GLENWAL1"
-const WAL_VERSION = 1'u32
+const WAL_VERSION = 2'u32
 const MAX_WAL_RECORD_SIZE = 64 * 1024 * 1024  # 64 MiB safety cap
 
 type
@@ -25,6 +25,10 @@ type
     docId*: string
     version*: uint64
     value*: Value  # only for put
+    # Replication metadata (v2+). Optional when reading v1 segments.
+    changeId*: string
+    originNode*: string
+    hlc*: Hlc
 
   WriteAheadLog* = ref object
     dir*: string
@@ -101,6 +105,27 @@ proc openWriteAheadLog*(dir: string; maxSegmentSize = 8 * 1024 * 1024; syncMode:
   var idx = 0
   while fileExists(segmentPath(dir, idx + 1)): inc idx
   result.currentIndex = idx
+  # If existing last segment has older header version, start a new segment to upgrade
+  if fileExists(segmentPath(dir, idx)):
+    var fs: Stream = nil
+    var f: File
+    var fOpened = false
+    try:
+      f = open(segmentPath(dir, idx), fmRead)
+      fOpened = true
+      fs = newFileStream(f)
+      let magic = fs.readStr(WAL_MAGIC.len)
+      if magic == WAL_MAGIC:
+        let ver = fs.readUint32()
+        if ver != WAL_VERSION:
+          result.currentIndex = idx + 1
+    except IOError:
+      discard
+    finally:
+      if fs != nil:
+        fs.close()
+      elif fOpened:
+        f.close()
   result.openSegment()
 
 proc rotateIfNeeded(wal: WriteAheadLog; needed: int) =
@@ -142,6 +167,13 @@ proc totalSize*(wal: WriteAheadLog): int =
     inc idx
   sum
 
+proc flush*(wal: WriteAheadLog) =
+  ## Force flush the current WAL file to disk regardless of sync policy.
+  acquire(wal.lock)
+  defer: release(wal.lock)
+  if wal.fs != nil:
+    wal.fs.flushFile()
+
 proc append*(wal: WriteAheadLog; rec: WalRecord) =
   acquire(wal.lock)
   defer: release(wal.lock)
@@ -161,6 +193,12 @@ proc append*(wal: WriteAheadLog; rec: WalRecord) =
     ms.write(payload)
   else:
     writeVarUint(ms, 0) # zero length
+  # Replication metadata (v2+): write strings and HLC
+  writeVarUint(ms, uint64(rec.changeId.len)); if rec.changeId.len > 0: ms.write(rec.changeId)
+  writeVarUint(ms, uint64(rec.originNode.len)); if rec.originNode.len > 0: ms.write(rec.originNode)
+  ms.write(rec.hlc.wallMillis)
+  ms.write(rec.hlc.counter)
+  writeVarUint(ms, uint64(rec.hlc.nodeId.len)); if rec.hlc.nodeId.len > 0: ms.write(rec.hlc.nodeId)
 
   let body = ms.data
   let crc = fnv1a32(body)
@@ -208,6 +246,12 @@ proc appendMany*(wal: WriteAheadLog; recs: openArray[WalRecord]) =
       ms.write(payload)
     else:
       writeVarUint(ms, 0)
+    # Replication metadata (v2+)
+    writeVarUint(ms, uint64(rec.changeId.len)); if rec.changeId.len > 0: ms.write(rec.changeId)
+    writeVarUint(ms, uint64(rec.originNode.len)); if rec.originNode.len > 0: ms.write(rec.originNode)
+    ms.write(rec.hlc.wallMillis)
+    ms.write(rec.hlc.counter)
+    writeVarUint(ms, uint64(rec.hlc.nodeId.len)); if rec.hlc.nodeId.len > 0: ms.write(rec.hlc.nodeId)
 
     let body = ms.data
     let crc = fnv1a32(body)
@@ -248,12 +292,13 @@ iterator replay*(dir: string): WalRecord =
     # Validate segment header
     let magic = fs.readStr(WAL_MAGIC.len)
     if magic != WAL_MAGIC:
-      f.close()
+      fs.close()
       inc idx
       continue
     let ver = fs.readUint32()
-    if ver != WAL_VERSION:
-      f.close()
+    # Support v1 (legacy) and v2 (current). Skip unknown versions.
+    if ver != 1'u32 and ver != 2'u32:
+      fs.close()
       inc idx
       continue
     var ok = true
@@ -279,11 +324,21 @@ iterator replay*(dir: string): WalRecord =
         if rType == wrPut and vlen > 0:
           let enc = rs.readStr(vlen)
           val = decode(enc)
-        yield WalRecord(kind: rType, collection: collection, docId: docId, version: version, value: val)
+        if ver == 1'u32:
+          yield WalRecord(kind: rType, collection: collection, docId: docId, version: version, value: val)
+        else:
+          # v2: read replication metadata
+          let cidLen = int(readVarUint(rs)); let changeId = if cidLen > 0: rs.readStr(cidLen) else: ""
+          let onLen = int(readVarUint(rs)); let originNode = if onLen > 0: rs.readStr(onLen) else: ""
+          let wall = rs.readInt64()
+          let ctr = rs.readUint32()
+          let hnLen = int(readVarUint(rs)); let hlcNode = if hnLen > 0: rs.readStr(hnLen) else: ""
+          let rec = WalRecord(kind: rType, collection: collection, docId: docId, version: version, value: val, changeId: changeId, originNode: originNode, hlc: Hlc(wallMillis: wall, counter: ctr, nodeId: hlcNode))
+          yield rec
       except IOError:
         ok = false
         break
-    f.close()
+    fs.close()
     # proceed to next segment even if this one had tail corruption
     inc idx
 

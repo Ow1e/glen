@@ -9,6 +9,7 @@ type
     walFlushEveryBytes*: int      # bytes for interval mode
     cacheCapacityBytes*: int
     cacheShards*: int
+    nodeId*: string
 
 let defaultMaxStringOrBytes = 16 * 1024 * 1024
 let defaultMaxArrayLen = 1_000_000
@@ -28,7 +29,8 @@ proc loadConfig*(): GlenConfig =
     walSyncMode: getEnv("GLEN_WAL_SYNC").toLowerAscii(),
     walFlushEveryBytes: parseIntEnv("GLEN_WAL_FLUSH_BYTES", 8 * 1024 * 1024),
     cacheCapacityBytes: parseIntEnv("GLEN_CACHE_CAP_BYTES", 64 * 1024 * 1024),
-    cacheShards: parseIntEnv("GLEN_CACHE_SHARDS", 16)
+    cacheShards: parseIntEnv("GLEN_CACHE_SHARDS", 16),
+    nodeId: getEnv("GLEN_NODE_ID")
   )
 
 
