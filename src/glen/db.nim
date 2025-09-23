@@ -151,17 +151,25 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
 
 # ---- Replication peers state and log GC ----
 proc savePeersState(db: GlenDB) =
+  # Snapshot peersCursors under read lock to avoid races, then write file
+  acquireRead(db.rw)
   var lines: seq[string] = @[]
   for peer, seq in db.peersCursors:
     lines.add(peer & " " & $seq)
+  releaseRead(db.rw)
   writeFile(db.peersStatePath, lines.join("\n"))
 
 proc setPeerCursor*(db: GlenDB; peerId: string; seq: uint64) =
+  acquireWrite(db.rw)
   db.peersCursors[peerId] = seq
+  releaseWrite(db.rw)
   db.savePeersState()
 
 proc getPeerCursor*(db: GlenDB; peerId: string): uint64 =
-  if peerId in db.peersCursors: db.peersCursors[peerId] else: 0'u64
+  acquireRead(db.rw)
+  let res = (if peerId in db.peersCursors: db.peersCursors[peerId] else: 0'u64)
+  releaseRead(db.rw)
+  res
 
 proc minPeerCursor(db: GlenDB): uint64 =
   var minVal: uint64 = high(uint64)
@@ -172,12 +180,22 @@ proc minPeerCursor(db: GlenDB): uint64 =
 
 proc gcReplLog*(db: GlenDB) =
   ## Trim in-memory replication log up to the minimum acknowledged cursor across peers.
-  let cutoff = db.minPeerCursor()
-  if cutoff == 0'u64: return
+  acquireWrite(db.rw)
+  # Compute cutoff under the replication write lock to avoid races
+  var cutoff: uint64 = high(uint64)
+  if db.peersCursors.len == 0:
+    cutoff = 0'u64
+  else:
+    for _, seq in db.peersCursors:
+      if seq < cutoff: cutoff = seq
+  if cutoff == 0'u64:
+    releaseWrite(db.rw)
+    return
   var kept: seq[(uint64, ReplChange)] = @[]
   for (seqNo, ch) in db.replLog:
     if seqNo > cutoff: kept.add((seqNo, ch))
   db.replLog = kept
+  releaseWrite(db.rw)
 
 # ---- Stripe locking helpers ----
 proc stripeIndex(db: GlenDB; collection: string): int =
@@ -383,6 +401,7 @@ proc getAll*(db: GlenDB; collection: string; t: Txn): seq[(string, Value)] =
 ## Upsert a document value. Appends to WAL, updates in-memory state, versions,
 ## cache, and notifies subscribers.
 proc put*(db: GlenDB; collection, docId: string; value: Value) =
+  acquireWrite(db.rw)
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   db.acquireStripeWrite(collection)
@@ -418,6 +437,7 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
   notifications.add((Id(collection: collection, docId: docId, version: newVer), stored))
   fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
   db.releaseStripeWrite(collection)
+  releaseWrite(db.rw)
   for it in notifications:
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
@@ -426,6 +446,7 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
 ## Delete a document if it exists. Appends a delete to WAL, removes from
 ## in-memory state and cache, bumps the version, and notifies subscribers.
 proc delete*(db: GlenDB; collection, docId: string) =
+  acquireWrite(db.rw)
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   db.acquireStripeWrite(collection)
@@ -454,6 +475,7 @@ proc delete*(db: GlenDB; collection, docId: string) =
     notifications.add((Id(collection: collection, docId: docId, version: ver), VNull()))
     fieldNotifications.add((Id(collection: collection, docId: docId, version: ver), oldDoc, nil))
   db.releaseStripeWrite(collection)
+  releaseWrite(db.rw)
   for it in notifications:
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
@@ -476,6 +498,8 @@ proc currentVersion*(db: GlenDB; collection, docId: string): uint64 =
 proc commit*(db: GlenDB; t: Txn): CommitResult =
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
+  # Acquire global replication write lock first to serialize access to replSeq/localHlc/replLog
+  acquireWrite(db.rw)
   # Acquire all needed collection stripes in sorted order
   var stripes: seq[int] = @[]
   for key, _ in t.writes:
@@ -492,6 +516,7 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
     if cur != ver:
       t.state = tsRolledBack
       db.releaseStripesWrite(stripes)
+      releaseWrite(db.rw)
       return CommitResult(status: csConflict, message: "Version mismatch for " & k)
   # apply writes (compute WAL with replication metadata, then mutate, then log)
   var walRecs: seq[WalRecord] = @[]
@@ -556,6 +581,7 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
     db.replLog.add(entry)
   t.state = tsCommitted
   db.releaseStripesWrite(stripes)
+  releaseWrite(db.rw)
   for it in notifications:
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
@@ -596,6 +622,7 @@ proc subscribeFieldDeltaStream*(db: GlenDB; collection, docId: string; fieldPath
 
 ## Batch put: apply multiple upserts under one write lock, batch WAL appends, update indexes and cache.
 proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)]) =
+  acquireWrite(db.rw)
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   db.acquireStripeWrite(collection)
@@ -634,16 +661,20 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
   for entry in replEntries:
     db.replLog.add(entry)
   db.releaseStripeWrite(collection)
+  releaseWrite(db.rw)
   for it in notifications: db.subs.notify(it[0], it[1])
   for it in fieldNotifications: db.subs.notifyFieldChanges(it[0], it[1], it[2])
 
 ## Batch delete: delete multiple documents under one write lock, batch WAL appends.
 proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
+  acquireWrite(db.rw)
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   db.acquireStripeWrite(collection)
   if collection notin db.collections:
-    db.releaseStripeWrite(collection); return
+    db.releaseStripeWrite(collection)
+    releaseWrite(db.rw)
+    return
   var walRecs: seq[WalRecord] = @[]
   var replEntries: seq[(uint64, ReplChange)] = @[]
   for docId in docIds:
@@ -673,6 +704,7 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
   for entry in replEntries:
     db.replLog.add(entry)
   db.releaseStripeWrite(collection)
+  releaseWrite(db.rw)
   for it in notifications: db.subs.notify(it[0], it[1])
   for it in fieldNotifications: db.subs.notifyFieldChanges(it[0], it[1], it[2])
 
@@ -782,6 +814,7 @@ proc exportChanges*(db: GlenDB; since: ReplExportCursor; includeCollections: seq
   for c in excludeCollections: deny[c] = true
   var changesOut: seq[ReplChange] = @[]
   var nextCursor = since
+  acquireRead(db.rw)
   for (seqNo, ch) in db.replLog:
     if seqNo <= since: continue
     if includeCollections.len > 0 and ch.collection notin allow: continue
@@ -790,18 +823,25 @@ proc exportChanges*(db: GlenDB; since: ReplExportCursor; includeCollections: seq
     if ch.changeId.len == 0: continue
     changesOut.add(ch)
     if seqNo > nextCursor: nextCursor = seqNo
-  return (nextCursor, changesOut)
+  let res = (nextCursor, changesOut)
+  releaseRead(db.rw)
+  return res
 
 proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
   ## Apply a batch of changes from a remote node. Idempotent via changeId; resolves conflicts using HLC (LWW semantics).
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   var acceptedAny = false
+  # Serialize with local writers and export by taking the replication write lock
+  acquireWrite(db.rw)
+  # Acquire all required collection stripe locks to make this batch atomic
+  var stripes: seq[int] = @[]
+  for ch in changes:
+    stripes.add(db.stripeIndex(ch.collection))
+  db.acquireStripesWrite(stripes)
   for ch in changes:
     let coll = ch.collection
     let id = ch.docId
-    let stripe = db.stripeIndex(coll)
-    acquireWrite(db.lockStripes[stripe])
     # init per-collection maps
     if coll notin db.collections: db.collections[coll] = initTable[string, Value]()
     if coll notin db.versions: db.versions[coll] = initTable[string, uint64]()
@@ -809,7 +849,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
     if coll notin db.replMetaChangeId: db.replMetaChangeId[coll] = initTable[string, string]()
     # idempotency
     if id in db.replMetaChangeId[coll] and db.replMetaChangeId[coll][id] == ch.changeId:
-      releaseWrite(db.lockStripes[stripe]); continue
+      db.mergeRemoteHlc(ch.hlc)
+      continue
     # conflict resolution (LWW by HLC)
     var accept = true
     if id in db.replMetaHlc[coll]:
@@ -846,9 +887,10 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
         fieldNotifications.add((Id(collection: coll, docId: id, version: ch.version), oldDoc, stored))
       db.replMetaHlc[coll][id] = ch.hlc
       db.replMetaChangeId[coll][id] = ch.changeId
-    releaseWrite(db.lockStripes[stripe])
-    # Merge remote HLC into local clock
+    # Merge remote HLC into local clock under lock
     db.mergeRemoteHlc(ch.hlc)
+  db.releaseStripesWrite(stripes)
+  releaseWrite(db.rw)
   # Fire notifications outside locks
   for it in notifications:
     db.subs.notify(it[0], it[1])
