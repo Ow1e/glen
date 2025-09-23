@@ -11,9 +11,9 @@ suite "wal and snapshot tests":
     if dirExists(dir): removeDir(dir)
     let w = openWriteAheadLog(dir)
     let v1 = VString("one")
-    w.append(WalRecord(kind: wrPut, collection: "x", docId: "a", version: 1'u64, value: v1))
+    w.append(WalRecord(kind: wrPut, collection: "x", docId: "a", version: 1'u64, value: v1, changeId: "1:test", originNode: "test", hlc: Hlc(wallMillis: 1'i64, counter: 0'u32, nodeId: "test")))
     let v2 = VString("two")
-    w.append(WalRecord(kind: wrPut, collection: "x", docId: "b", version: 1'u64, value: v2))
+    w.append(WalRecord(kind: wrPut, collection: "x", docId: "b", version: 1'u64, value: v2, changeId: "2:test", originNode: "test", hlc: Hlc(wallMillis: 2'i64, counter: 0'u32, nodeId: "test")))
     w.close()
     let walPath = dir / "glen.wal.0"
     var data = readFile(walPath)

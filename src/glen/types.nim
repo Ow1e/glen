@@ -134,6 +134,7 @@ proc clone*(v: Value): Value =
 proc `$`*(id: Id): string = id.collection & ":" & id.docId & "@" & $id.version
 
 proc `$`*(v: Value): string =
+  if v.isNil: return "null"
   case v.kind
   of vkNull: "null"
   of vkBool: $(v.b)

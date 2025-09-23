@@ -1,6 +1,6 @@
 # Glen DB high-level API
 
-import std/[os, tables, locks, strutils, streams, hashes, algorithm]
+import std/[os, tables, locks, strutils, streams, hashes, algorithm, parseutils]
 import glen/types, glen/wal, glen/storage, glen/cache, glen/subscription, glen/txn
 import glen/rwlock
 import glen/index
@@ -45,6 +45,11 @@ type
     replMetaHlc: Table[string, Table[string, Hlc]]
     # last applied changeId per doc for idempotency
     replMetaChangeId: Table[string, Table[string, string]]
+    # local HLC state
+    localHlc: Hlc
+    # Replication peers cursors (peerId -> last exported/applied seq)
+    peersCursors: Table[string, uint64]
+    peersStatePath: string
 
 ## Create or open a Glen database at the given directory.
 ## Loads snapshots, replays the WAL, and initializes cache and subscriptions.
@@ -69,10 +74,22 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
     initRwLock(result.lockStripes[i])
   # derive nodeId if provided
   let cfg = loadConfig()
+  # Persisted/stable node id
+  let nodeIdPath = dir / "node.id"
   if cfg.nodeId.len > 0:
     result.nodeId = cfg.nodeId
+    # if no file exists, persist
+    if not fileExists(nodeIdPath): writeFile(nodeIdPath, result.nodeId)
+  elif fileExists(nodeIdPath):
+    try:
+      result.nodeId = readFile(nodeIdPath).strip()
+    except IOError:
+      result.nodeId = $nowMillis() & ":" & $cast[uint64](result)
   else:
     result.nodeId = $nowMillis() & ":" & $cast[uint64](result)
+    writeFile(nodeIdPath, result.nodeId)
+  # init local HLC
+  result.localHlc = Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: result.nodeId)
   # load snapshots
   for kind, path in walkDir(dir):
     if kind == pcFile and path.endsWith(".snap"):
@@ -80,7 +97,23 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
       result.collections[name] = loadSnapshot(dir, name)
       # Initialize versions table with 0; actual versions will be set by WAL replay
       result.versions[name] = initTable[string, uint64]()
-  # replay wal
+  # peers state path
+  result.peersStatePath = dir / "peers.state"
+  result.peersCursors = initTable[string, uint64]()
+  if fileExists(result.peersStatePath):
+    try:
+      let content = readFile(result.peersStatePath)
+      for line in content.split('\n'):
+        let ln = line.strip()
+        if ln.len == 0: continue
+        let parts = ln.splitWhitespace()
+        if parts.len == 2:
+          var n: int
+          if parseInt(parts[1], n) == parts[1].len and n >= 0:
+            result.peersCursors[parts[0]] = uint64(n)
+    except IOError:
+      discard
+  # replay wal (also rebuild versions/indexes and in-memory replication log)
   for rec in replay(dir):
     var coll: CollectionStore
     if rec.collection notin result.collections:
@@ -103,6 +136,48 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
             idx.unindexDoc(rec.docId, oldDoc)
         coll.del(rec.docId)
       if rec.docId in result.versions[rec.collection]: result.versions[rec.collection].del(rec.docId)
+    # Rebuild in-memory repl log cursor from WAL (uses v2 metadata when present)
+    inc result.replSeq
+    var ch: ReplChange
+    ch.collection = rec.collection
+    ch.docId = rec.docId
+    ch.op = (if rec.kind == wrPut: roPut else: roDelete)
+    ch.version = rec.version
+    ch.value = rec.value
+    ch.changeId = rec.changeId
+    ch.originNode = rec.originNode
+    ch.hlc = rec.hlc
+    result.replLog.add((result.replSeq, ch))
+
+# ---- Replication peers state and log GC ----
+proc savePeersState(db: GlenDB) =
+  var lines: seq[string] = @[]
+  for peer, seq in db.peersCursors:
+    lines.add(peer & " " & $seq)
+  writeFile(db.peersStatePath, lines.join("\n"))
+
+proc setPeerCursor*(db: GlenDB; peerId: string; seq: uint64) =
+  db.peersCursors[peerId] = seq
+  db.savePeersState()
+
+proc getPeerCursor*(db: GlenDB; peerId: string): uint64 =
+  if peerId in db.peersCursors: db.peersCursors[peerId] else: 0'u64
+
+proc minPeerCursor(db: GlenDB): uint64 =
+  var minVal: uint64 = high(uint64)
+  if db.peersCursors.len == 0: return 0'u64
+  for _, seq in db.peersCursors:
+    if seq < minVal: minVal = seq
+  minVal
+
+proc gcReplLog*(db: GlenDB) =
+  ## Trim in-memory replication log up to the minimum acknowledged cursor across peers.
+  let cutoff = db.minPeerCursor()
+  if cutoff == 0'u64: return
+  var kept: seq[(uint64, ReplChange)] = @[]
+  for (seqNo, ch) in db.replLog:
+    if seqNo > cutoff: kept.add((seqNo, ch))
+  db.replLog = kept
 
 # ---- Stripe locking helpers ----
 proc stripeIndex(db: GlenDB; collection: string): int =
@@ -157,6 +232,24 @@ proc releaseStripesWrite(db: GlenDB; stripes: seq[int]) =
     releaseWrite(db.lockStripes[i])
     if j == 0: break
     idx = j - 1
+
+# ---- HLC helpers ----
+proc nextLocalHlc(db: GlenDB): Hlc =
+  let now = nowMillis()
+  if now > db.localHlc.wallMillis:
+    db.localHlc.wallMillis = now
+    db.localHlc.counter = 0'u32
+  else:
+    db.localHlc.counter = db.localHlc.counter + 1
+  db.localHlc
+
+proc mergeRemoteHlc(db: GlenDB; remote: Hlc) =
+  # Advance local clock on receipt to maintain monotonicity
+  if remote.wallMillis > db.localHlc.wallMillis:
+    db.localHlc.wallMillis = remote.wallMillis
+    db.localHlc.counter = remote.counter
+  elif remote.wallMillis == db.localHlc.wallMillis and remote.counter > db.localHlc.counter:
+    db.localHlc.counter = remote.counter
 
 ## Get the current value of a document by collection and id.
 ## Returns nil if not found. Cached reads are served from the LRU cache.
@@ -301,11 +394,19 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
   if docId in db.versions[collection]: oldVer = db.versions[collection][docId]
   let newVer = oldVer + 1
   var stored = value.clone()
-  db.wal.append(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored))
-  # record replication change (local origin)
+  # assign replication metadata and append to WAL before mutating (write-ahead)
   inc db.replSeq
-  let ch = ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: stored, changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))
+  let chHlc = db.nextLocalHlc()
+  let chChangeId = $db.replSeq & ":" & db.nodeId
+  db.wal.append(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
+  # record replication change (local origin)
+  let ch = ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
   db.replLog.add((db.replSeq, ch))
+  # update local replication metadata for conflict resolution/idempotency
+  if collection notin db.replMetaHlc: db.replMetaHlc[collection] = initTable[string, Hlc]()
+  if collection notin db.replMetaChangeId: db.replMetaChangeId[collection] = initTable[string, string]()
+  db.replMetaHlc[collection][docId] = chHlc
+  db.replMetaChangeId[collection][docId] = chChangeId
   var oldDoc: Value = nil
   if docId in db.collections[collection]: oldDoc = db.collections[collection][docId]
   db.collections[collection][docId] = stored
@@ -332,10 +433,16 @@ proc delete*(db: GlenDB; collection, docId: string) =
     var ver = 1'u64
     if collection in db.versions and docId in db.versions[collection]:
       ver = db.versions[collection][docId] + 1
-    db.wal.append(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver))
     inc db.replSeq
-    let ch = ReplChange(collection: collection, docId: docId, op: roDelete, version: ver, value: nil, changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))
+    let chHlc = db.nextLocalHlc()
+    let chChangeId = $db.replSeq & ":" & db.nodeId
+    db.wal.append(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
+    let ch = ReplChange(collection: collection, docId: docId, op: roDelete, version: ver, value: nil, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
     db.replLog.add((db.replSeq, ch))
+    if collection notin db.replMetaHlc: db.replMetaHlc[collection] = initTable[string, Hlc]()
+    if collection notin db.replMetaChangeId: db.replMetaChangeId[collection] = initTable[string, string]()
+    db.replMetaHlc[collection][docId] = chHlc
+    db.replMetaChangeId[collection][docId] = chChangeId
     var oldDoc = db.collections[collection][docId]
     if collection in db.indexes:
       for _, idx in db.indexes[collection]:
@@ -386,15 +493,19 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       t.state = tsRolledBack
       db.releaseStripesWrite(stripes)
       return CommitResult(status: csConflict, message: "Version mismatch for " & k)
-  # apply writes
+  # apply writes (compute WAL with replication metadata, then mutate, then log)
   var walRecs: seq[WalRecord] = @[]
+  var replEntries: seq[(uint64, ReplChange)] = @[]
   for key, w in t.writes:
     let collection = key[0]
     let docId = key[1]
     if w.kind == twDelete:
       if collection in db.collections and docId in db.collections[collection]:
         let newVer = db.currentVersion(collection, docId) + 1
-        walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: newVer))
+        inc db.replSeq
+        let chHlc = db.nextLocalHlc()
+        let chChangeId = $db.replSeq & ":" & db.nodeId
+        walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: newVer, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
         var oldDoc = db.collections[collection][docId]
         if collection in db.indexes:
           for _, idx in db.indexes[collection]:
@@ -405,11 +516,20 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
         db.cache.del(collection & ":" & docId)
         notifications.add((Id(collection: collection, docId: docId, version: newVer), VNull()))
         fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, nil))
+        let ch = ReplChange(collection: collection, docId: docId, op: roDelete, version: newVer, value: nil, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
+        replEntries.add((db.replSeq, ch))
+        if collection notin db.replMetaHlc: db.replMetaHlc[collection] = initTable[string, Hlc]()
+        if collection notin db.replMetaChangeId: db.replMetaChangeId[collection] = initTable[string, string]()
+        db.replMetaHlc[collection][docId] = chHlc
+        db.replMetaChangeId[collection][docId] = chChangeId
     else:
       if collection notin db.collections:
         db.collections[collection] = initTable[string, Value]()
       let newVer = db.currentVersion(collection, docId) + 1
-      walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: w.value))
+      inc db.replSeq
+      let chHlc = db.nextLocalHlc()
+      let chChangeId = $db.replSeq & ":" & db.nodeId
+      walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: w.value, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
       var oldDoc: Value = nil
       if collection in db.collections and docId in db.collections[collection]:
         oldDoc = db.collections[collection][docId]
@@ -423,17 +543,17 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
           idx.reindexDoc(docId, oldDoc, w.value)
       notifications.add((Id(collection: collection, docId: docId, version: newVer), w.value))
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
+      let ch = ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: w.value, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
+      replEntries.add((db.replSeq, ch))
+      if collection notin db.replMetaHlc: db.replMetaHlc[collection] = initTable[string, Hlc]()
+      if collection notin db.replMetaChangeId: db.replMetaChangeId[collection] = initTable[string, string]()
+      db.replMetaHlc[collection][docId] = chHlc
+      db.replMetaChangeId[collection][docId] = chChangeId
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
-  # record replication changes
-  for key, w in t.writes:
-    let collection = key[0]
-    let docId = key[1]
-    inc db.replSeq
-    if w.kind == twDelete:
-      db.replLog.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roDelete, version: db.currentVersion(collection, docId), value: nil, changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))))
-    else:
-      db.replLog.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roPut, version: db.currentVersion(collection, docId), value: db.collections[collection][docId], changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))))
+  # record replication changes (with precomputed seq)
+  for entry in replEntries:
+    db.replLog.add(entry)
   t.state = tsCommitted
   db.releaseStripesWrite(stripes)
   for it in notifications:
@@ -484,12 +604,21 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
   if collection notin db.versions:
     db.versions[collection] = initTable[string, uint64]()
   var walRecs: seq[WalRecord] = @[]
+  var replEntries: seq[(uint64, ReplChange)] = @[]
   for (docId, value) in items:
     var oldVer = 0'u64
     if docId in db.versions[collection]: oldVer = db.versions[collection][docId]
     let newVer = oldVer + 1
     var stored = value.clone()
-    walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored))
+    inc db.replSeq
+    let chHlc = db.nextLocalHlc()
+    let chChangeId = $db.replSeq & ":" & db.nodeId
+    walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
+    replEntries.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)))
+    if collection notin db.replMetaHlc: db.replMetaHlc[collection] = initTable[string, Hlc]()
+    if collection notin db.replMetaChangeId: db.replMetaChangeId[collection] = initTable[string, string]()
+    db.replMetaHlc[collection][docId] = chHlc
+    db.replMetaChangeId[collection][docId] = chChangeId
     var oldDoc: Value = nil
     if docId in db.collections[collection]: oldDoc = db.collections[collection][docId]
     db.collections[collection][docId] = stored
@@ -502,9 +631,8 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
     fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
   if walRecs.len > 0: db.wal.appendMany(walRecs)
   # replication log for batch
-  for (docId, _) in items:
-    inc db.replSeq
-    db.replLog.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roPut, version: db.currentVersion(collection, docId), value: db.collections[collection][docId], changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))))
+  for entry in replEntries:
+    db.replLog.add(entry)
   db.releaseStripeWrite(collection)
   for it in notifications: db.subs.notify(it[0], it[1])
   for it in fieldNotifications: db.subs.notifyFieldChanges(it[0], it[1], it[2])
@@ -517,12 +645,21 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
   if collection notin db.collections:
     db.releaseStripeWrite(collection); return
   var walRecs: seq[WalRecord] = @[]
+  var replEntries: seq[(uint64, ReplChange)] = @[]
   for docId in docIds:
     if docId in db.collections[collection]:
       var ver = 1'u64
       if collection in db.versions and docId in db.versions[collection]:
         ver = db.versions[collection][docId] + 1
-      walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver))
+      inc db.replSeq
+      let chHlc = db.nextLocalHlc()
+      let chChangeId = $db.replSeq & ":" & db.nodeId
+      walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
+      replEntries.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roDelete, version: ver, value: nil, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)))
+      if collection notin db.replMetaHlc: db.replMetaHlc[collection] = initTable[string, Hlc]()
+      if collection notin db.replMetaChangeId: db.replMetaChangeId[collection] = initTable[string, string]()
+      db.replMetaHlc[collection][docId] = chHlc
+      db.replMetaChangeId[collection][docId] = chChangeId
       var oldDoc = db.collections[collection][docId]
       if collection in db.indexes:
         for _, idx in db.indexes[collection]:
@@ -533,9 +670,8 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
       notifications.add((Id(collection: collection, docId: docId, version: ver), VNull()))
       fieldNotifications.add((Id(collection: collection, docId: docId, version: ver), oldDoc, nil))
   if walRecs.len > 0: db.wal.appendMany(walRecs)
-  for docId in docIds:
-    inc db.replSeq
-    db.replLog.add((db.replSeq, ReplChange(collection: collection, docId: docId, op: roDelete, version: db.currentVersion(collection, docId), value: nil, changeId: $db.replSeq & ":" & db.nodeId, originNode: db.nodeId, hlc: Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: db.nodeId))))
+  for entry in replEntries:
+    db.replLog.add(entry)
   db.releaseStripeWrite(collection)
   for it in notifications: db.subs.notify(it[0], it[1])
   for it in fieldNotifications: db.subs.notifyFieldChanges(it[0], it[1], it[2])
@@ -650,6 +786,8 @@ proc exportChanges*(db: GlenDB; since: ReplExportCursor; includeCollections: seq
     if seqNo <= since: continue
     if includeCollections.len > 0 and ch.collection notin allow: continue
     if ch.collection in deny: continue
+    # ensure we only export entries that have metadata (after WAL v2 or local ops)
+    if ch.changeId.len == 0: continue
     changesOut.add(ch)
     if seqNo > nextCursor: nextCursor = seqNo
   return (nextCursor, changesOut)
@@ -658,6 +796,7 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
   ## Apply a batch of changes from a remote node. Idempotent via changeId; resolves conflicts using HLC (LWW semantics).
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
+  var acceptedAny = false
   for ch in changes:
     let coll = ch.collection
     let id = ch.docId
@@ -678,12 +817,15 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       if hlcCompare(ch.hlc, cur) < 0:
         accept = false
     if accept:
+      acceptedAny = true
       if ch.op == roDelete:
         var oldDoc: Value = nil
         if id in db.collections[coll]:
           oldDoc = db.collections[coll][id]
           if coll in db.indexes:
             for _, idx in db.indexes[coll]: idx.unindexDoc(id, oldDoc)
+          # WAL append for remote delete BEFORE mutating state
+          db.wal.append(WalRecord(kind: wrDelete, collection: coll, docId: id, version: ch.version, changeId: ch.changeId, originNode: ch.originNode, hlc: ch.hlc))
           db.collections[coll].del(id)
         if id in db.versions[coll]: db.versions[coll].del(id)
         db.cache.del(coll & ":" & id)
@@ -693,6 +835,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
         var stored = if ch.value.isNil: VNull() else: ch.value
         var oldDoc: Value = nil
         if id in db.collections[coll]: oldDoc = db.collections[coll][id]
+        # WAL append for remote put BEFORE mutating state
+        db.wal.append(WalRecord(kind: wrPut, collection: coll, docId: id, version: ch.version, value: stored, changeId: ch.changeId, originNode: ch.originNode, hlc: ch.hlc))
         db.collections[coll][id] = stored
         db.versions[coll][id] = ch.version
         db.cache.put(coll & ":" & id, stored)
@@ -703,9 +847,13 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       db.replMetaHlc[coll][id] = ch.hlc
       db.replMetaChangeId[coll][id] = ch.changeId
     releaseWrite(db.lockStripes[stripe])
+    # Merge remote HLC into local clock
+    db.mergeRemoteHlc(ch.hlc)
   # Fire notifications outside locks
   for it in notifications:
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
+  if acceptedAny and db.wal != nil:
+    db.wal.flush()
 
