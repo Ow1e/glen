@@ -115,7 +115,7 @@ proc openWriteAheadLog*(dir: string; maxSegmentSize = 8 * 1024 * 1024; syncMode:
         let ver = fs.readUint32()
         if ver != WAL_VERSION:
           result.currentIndex = idx + 1
-      fs.close(); f.close()
+      fs.close()
     except IOError:
       discard
   result.openSegment()
@@ -284,13 +284,13 @@ iterator replay*(dir: string): WalRecord =
     # Validate segment header
     let magic = fs.readStr(WAL_MAGIC.len)
     if magic != WAL_MAGIC:
-      f.close()
+      fs.close()
       inc idx
       continue
     let ver = fs.readUint32()
     # Support v1 (legacy) and v2 (current). Skip unknown versions.
     if ver != 1'u32 and ver != 2'u32:
-      f.close()
+      fs.close()
       inc idx
       continue
     var ok = true
@@ -330,7 +330,7 @@ iterator replay*(dir: string): WalRecord =
       except IOError:
         ok = false
         break
-    f.close()
+    fs.close()
     # proceed to next segment even if this one had tail corruption
     inc idx
 
