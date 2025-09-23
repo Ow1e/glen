@@ -532,6 +532,7 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
   db.acquireStripesWrite(stripes)
   if t.state != tsActive:
     db.releaseStripesWrite(stripes)
+    releaseWrite(db.rw)
     return CommitResult(status: csInvalid, message: "Transaction not active")
   # validate
   for k, ver in t.readVersions:

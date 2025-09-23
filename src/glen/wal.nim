@@ -107,17 +107,25 @@ proc openWriteAheadLog*(dir: string; maxSegmentSize = 8 * 1024 * 1024; syncMode:
   result.currentIndex = idx
   # If existing last segment has older header version, start a new segment to upgrade
   if fileExists(segmentPath(dir, idx)):
+    var fs: Stream = nil
+    var f: File
+    var fOpened = false
     try:
-      let f = open(segmentPath(dir, idx), fmRead)
-      let fs = newFileStream(f)
+      f = open(segmentPath(dir, idx), fmRead)
+      fOpened = true
+      fs = newFileStream(f)
       let magic = fs.readStr(WAL_MAGIC.len)
       if magic == WAL_MAGIC:
         let ver = fs.readUint32()
         if ver != WAL_VERSION:
           result.currentIndex = idx + 1
-      fs.close()
     except IOError:
       discard
+    finally:
+      if fs != nil:
+        fs.close()
+      elif fOpened:
+        f.close()
   result.openSegment()
 
 proc rotateIfNeeded(wal: WriteAheadLog; needed: int) =
