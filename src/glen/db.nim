@@ -36,6 +36,8 @@ type
     lock: Lock
     rw: RwLock
     lockStripes: seq[RwLock]
+    # Replication sequencing / clock / log lock (separate from data locks)
+    replLock: Lock
     # Replication
     nodeId*: string
     replSeq: uint64
@@ -89,6 +91,7 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
     replMetaChangeId: initTable[string, Table[string, string]]()
   )
   initLock(result.lock)
+  initLock(result.replLock)
   initRwLock(result.rw)
   result.lockStripes.setLen(lockStripesCount)
   for i in 0 ..< lockStripesCount:
@@ -540,14 +543,12 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
     return CommitResult(status: csInvalid, message: "Transaction not active")
   # validate
   for k, ver in t.readVersions:
-    let parts = k.split(":")
-    if parts.len != 2: continue
-    let cur = db.currentVersion(parts[0], parts[1])
+    let cur = db.currentVersion(k[0], k[1])
     if cur != ver:
       t.state = tsRolledBack
       db.releaseStripesWrite(stripes)
       releaseWrite(db.rw)
-      return CommitResult(status: csConflict, message: "Version mismatch for " & k)
+      return CommitResult(status: csConflict, message: "Version mismatch for " & k[0] & ":" & k[1])
   # apply writes (compute WAL with replication metadata, then mutate, then log)
   var walRecs: seq[WalRecord] = @[]
   var replEntries: seq[(uint64, ReplChange)] = @[]
@@ -775,7 +776,8 @@ proc findBy*(db: GlenDB; collection: string; indexName: string; keyValue: Value;
   result = @[]
   for id in idx.findEq(keyValue, limit):
     if collection in db.collections and id in db.collections[collection]:
-      result.add((id, db.collections[collection][id]))
+      let v = db.collections[collection][id]
+      result.add((id, v.clone()))
 
 ## Range query on a single-field index, with order and limit.
 proc rangeBy*(db: GlenDB; collection: string; indexName: string; minVal, maxVal: Value; inclusiveMin = true; inclusiveMax = true; limit = 0; asc = true): seq[(string, Value)] =
@@ -786,7 +788,8 @@ proc rangeBy*(db: GlenDB; collection: string; indexName: string; minVal, maxVal:
   result = @[]
   for id in idx.findRange(minVal, maxVal, inclusiveMin, inclusiveMax, limit, asc):
     if collection in db.collections and id in db.collections[collection]:
-      result.add((id, db.collections[collection][id]))
+      let v = db.collections[collection][id]
+      result.add((id, v.clone()))
 
 # Compaction: snapshot all collections and truncate WAL
 ## Snapshot all collections and truncate the WAL so that recovery can start
@@ -866,6 +869,7 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
   acquireWrite(db.rw)
   # Acquire all required collection stripe locks to make this batch atomic
   var stripes: seq[int] = @[]
+  var walRecs: seq[WalRecord] = @[]
   for ch in changes:
     stripes.add(db.stripeIndex(ch.collection))
   db.acquireStripesWrite(stripes)
@@ -895,8 +899,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
           oldDoc = db.collections[coll][id]
           if coll in db.indexes:
             for _, idx in db.indexes[coll]: idx.unindexDoc(id, oldDoc)
-          # WAL append for remote delete BEFORE mutating state
-          db.wal.append(WalRecord(kind: wrDelete, collection: coll, docId: id, version: ch.version, changeId: ch.changeId, originNode: ch.originNode, hlc: ch.hlc))
+          # WAL append for remote delete BEFORE mutating state (batched)
+          walRecs.add(WalRecord(kind: wrDelete, collection: coll, docId: id, version: ch.version, changeId: ch.changeId, originNode: ch.originNode, hlc: ch.hlc))
           db.collections[coll].del(id)
         if id in db.versions[coll]: db.versions[coll].del(id)
         db.cache.del(coll & ":" & id)
@@ -906,8 +910,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
         var stored = if ch.value.isNil: VNull() else: ch.value
         var oldDoc: Value = nil
         if id in db.collections[coll]: oldDoc = db.collections[coll][id]
-        # WAL append for remote put BEFORE mutating state
-        db.wal.append(WalRecord(kind: wrPut, collection: coll, docId: id, version: ch.version, value: stored, changeId: ch.changeId, originNode: ch.originNode, hlc: ch.hlc))
+        # WAL append for remote put BEFORE mutating state (batched)
+        walRecs.add(WalRecord(kind: wrPut, collection: coll, docId: id, version: ch.version, value: stored, changeId: ch.changeId, originNode: ch.originNode, hlc: ch.hlc))
         db.collections[coll][id] = stored
         db.versions[coll][id] = ch.version
         db.cache.put(coll & ":" & id, stored)
@@ -919,6 +923,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       db.replMetaChangeId[coll][id] = ch.changeId
     # Merge remote HLC into local clock under lock
     db.mergeRemoteHlc(ch.hlc)
+  if walRecs.len > 0:
+    db.wal.appendMany(walRecs)
   db.releaseStripesWrite(stripes)
   releaseWrite(db.rw)
   # Fire notifications outside locks
@@ -926,6 +932,5 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
-  if acceptedAny and db.wal != nil:
-    db.wal.flush()
+  # rely on WAL sync policy; no unconditional flush
 
