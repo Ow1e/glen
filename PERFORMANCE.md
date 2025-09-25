@@ -19,16 +19,19 @@ This document captures observed hot paths and proposed improvements to increase 
 - Optional fair mode for RwLock
   - Gate writer fairness with a compile-time flag (`-d:rwlockFair`): block new readers when writers are waiting to reduce write tail latency under heavy read load.
 
-### High impact, next up
+- Narrowed global locking
+  - Introduced `replLock` to protect only `replSeq`, `localHlc`, and `replLog` updates; `put`, `delete`, and `commit` use per-collection stripe locks for data/index/cache and briefly take `replLock` for replication metadata. Replication apply uses stripes plus `replLock` for metadata decisions.
+
+### High impact, next up (implemented)
 
 - Narrow global write lock with a dedicated replication metadata lock
   - Introduce a `replLock` focused on `replSeq`, `localHlc`, `replLog`, and replication metadata to reduce contention with per-collection writes. Apply carefully to `put`/`delete`/`commit` once validated to maintain ordering and write-ahead guarantees.
 
 - Replication export filtering/indexing
-  - For large `replLog`, consider per-collection cursors or an index to speed up `includeCollections`/`excludeCollections` filtering in `exportChanges`.
+  - Implemented per-collection replication logs (`replLogByCollection`) and updated `exportChanges` to scan per-collection logs when filters are present. Global scan used for no-filter fast path. `gcReplLog` trims both global and per-collection logs.
 
 - Peer cursor persistence batching
-  - Coalesce frequent `setPeerCursor` writes (e.g., debounce or timed flush) to reduce filesystem overhead during high-rate replication.
+  - Implemented a 500 ms debounce for `peers.state` writes and ensured a flush on `close()`. Consider making the debounce configurable.
 
 ### Medium impact
 
